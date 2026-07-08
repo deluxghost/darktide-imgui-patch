@@ -382,6 +382,119 @@ bool contains_bytes(const unsigned char* bytes, std::size_t size, const unsigned
     return false;
 }
 
+struct PlatformCallbackAssignment
+{
+    std::uintptr_t instruction = 0;
+    std::uintptr_t function = 0;
+    std::uint32_t slot_offset = 0;
+};
+
+bool read_platform_callback_assignment(
+    const ImageSection& text_section,
+    const unsigned char* instruction,
+    std::uintptr_t instruction_address,
+    PlatformCallbackAssignment* assignment)
+{
+    if (instruction == nullptr || assignment == nullptr) {
+        return false;
+    }
+
+    if (!(instruction[0] == 0x48 && instruction[1] == 0x8d && instruction[2] == 0x05 &&
+          instruction[7] == 0x48 && instruction[8] == 0x89 && instruction[9] == 0x83)) {
+        return false;
+    }
+
+    std::int32_t function_displacement = 0;
+    std::int32_t slot_offset = 0;
+    if (!read_unaligned_i32(instruction + 3, &function_displacement) ||
+        !read_unaligned_i32(instruction + 10, &slot_offset)) {
+        return false;
+    }
+
+    if (slot_offset <= 0 || static_cast<std::uintptr_t>(slot_offset) >= kContextScanBytes ||
+        (slot_offset % static_cast<std::int32_t>(sizeof(std::uintptr_t))) != 0) {
+        return false;
+    }
+
+    const auto function = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(instruction_address + 7) + function_displacement);
+    if (!address_in_section(text_section, function)) {
+        return false;
+    }
+
+    assignment->instruction = instruction_address;
+    assignment->function = function;
+    assignment->slot_offset = static_cast<std::uint32_t>(slot_offset);
+    return true;
+}
+
+bool find_platform_clipboard_offsets(
+    const ImageSection& text_section,
+    std::uintptr_t version_reference,
+    std::uintptr_t* get_clipboard_offset,
+    std::uintptr_t* set_clipboard_offset)
+{
+    if (get_clipboard_offset == nullptr || set_clipboard_offset == nullptr ||
+        !address_in_section(text_section, version_reference)) {
+        return false;
+    }
+
+    const std::size_t reference_offset = version_reference - text_section.address;
+    const std::size_t scan_end = std::min<std::size_t>(text_section.size, reference_offset + 0x200);
+    std::vector<PlatformCallbackAssignment> assignments;
+
+    if (scan_end < reference_offset + 14) {
+        set_last_error("CreateContext scan range is too small for ImGui platform callback slots");
+        return false;
+    }
+
+    for (std::size_t offset = reference_offset; offset <= scan_end - 14; ++offset) {
+        PlatformCallbackAssignment assignment = {};
+        if (read_platform_callback_assignment(
+                text_section,
+                text_section.begin + offset,
+                text_section.address + offset,
+                &assignment)) {
+            assignments.push_back(assignment);
+        }
+    }
+
+    std::uintptr_t resolved_get_offset = 0;
+    std::uintptr_t resolved_set_offset = 0;
+    int candidate_count = 0;
+
+    for (std::size_t index = 0; index + 3 < assignments.size(); ++index) {
+        const PlatformCallbackAssignment& first = assignments[index];
+        const PlatformCallbackAssignment& second = assignments[index + 1];
+        const PlatformCallbackAssignment& third = assignments[index + 2];
+        const PlatformCallbackAssignment& fourth = assignments[index + 3];
+
+        if (second.slot_offset != first.slot_offset + sizeof(std::uintptr_t) ||
+            third.slot_offset != first.slot_offset + sizeof(std::uintptr_t) * 3 ||
+            fourth.slot_offset != first.slot_offset + sizeof(std::uintptr_t) * 5) {
+            continue;
+        }
+
+        if (fourth.instruction - first.instruction > 0x80) {
+            continue;
+        }
+
+        ++candidate_count;
+        resolved_get_offset = first.slot_offset;
+        resolved_set_offset = second.slot_offset;
+    }
+
+    if (candidate_count != 1) {
+        char message[256] = {};
+        std::snprintf(message, sizeof(message), "ImGui platform callback slot scan found %d candidates", candidate_count);
+        set_last_error(message);
+        return false;
+    }
+
+    *get_clipboard_offset = resolved_get_offset;
+    *set_clipboard_offset = resolved_set_offset;
+    return true;
+}
+
 bool find_add_font_symbol(const ImageSection& text_section, std::uintptr_t* add_font)
 {
     static constexpr PatternByte kAddFontPattern[] = {
@@ -677,6 +790,16 @@ bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
         return false;
     }
 
+    std::uintptr_t platform_get_clipboard_text_offset = 0;
+    std::uintptr_t platform_set_clipboard_text_offset = 0;
+    if (!find_platform_clipboard_offsets(
+            text_section,
+            version_pointer_references[0],
+            &platform_get_clipboard_text_offset,
+            &platform_set_clipboard_text_offset)) {
+        return false;
+    }
+
     std::uintptr_t add_font = 0;
     if (!find_add_font_symbol(text_section, &add_font)) {
         return false;
@@ -706,6 +829,8 @@ bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
     symbols->build_atlas = build_atlas;
     symbols->calc_text_size = calc_text_size;
     symbols->render_text = render_text;
+    symbols->platform_get_clipboard_text_offset = platform_get_clipboard_text_offset;
+    symbols->platform_set_clipboard_text_offset = platform_set_clipboard_text_offset;
     return true;
 }
 }

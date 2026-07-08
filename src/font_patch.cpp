@@ -1,5 +1,6 @@
 #include "font_patch.h"
 
+#include "clipboard_patch.h"
 #include "font_batch.h"
 #include "imgui_atlas.h"
 #include "text_capture.h"
@@ -71,6 +72,10 @@ extern "C" __declspec(dllexport) int ImguiPatch_ConfigureFonts(char* output_buff
 
     try {
         set_last_error("");
+
+        if (!install_clipboard_patch()) {
+            return 0;
+        }
 
         PreparedFontBatch batch = prepare_base_font_batch();
         if (!batch.error.empty()) {

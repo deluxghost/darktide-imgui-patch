@@ -71,6 +71,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="src\clipboard_patch.h" />
     <ClInclude Include="src\font_batch.h" />
     <ClInclude Include="src\font_fallback.h" />
     <ClInclude Include="src\font_patch.h" />
@@ -82,6 +83,7 @@
     <ClInclude Include="src\writable_memory.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\clipboard_patch.cpp" />
     <ClCompile Include="src\dllmain.cpp" />
     <ClCompile Include="src\font_batch.cpp" />
     <ClCompile Include="src\font_fallback.cpp" />
