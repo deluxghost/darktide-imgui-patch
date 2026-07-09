@@ -3,6 +3,7 @@
 #include "clipboard_patch.h"
 #include "font_batch.h"
 #include "imgui_atlas.h"
+#include "input_patch.h"
 #include "text_capture.h"
 
 #include <chrono>
@@ -74,6 +75,10 @@ extern "C" __declspec(dllexport) int ImguiPatch_ConfigureFonts(char* output_buff
         set_last_error("");
 
         if (!install_clipboard_patch()) {
+            return 0;
+        }
+
+        if (!install_input_patch()) {
             return 0;
         }
 

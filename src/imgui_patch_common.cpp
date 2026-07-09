@@ -164,14 +164,14 @@ bool utf16_from_utf8(const char* utf8_text, std::wstring* utf16_text, std::strin
     }
 
     const int utf8_length = static_cast<int>(std::strlen(utf8_text));
-    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_text, utf8_length, nullptr, 0);
+    const int size = MultiByteToWideChar(CP_UTF8, 0, utf8_text, utf8_length, nullptr, 0);
     if (size <= 0) {
         *error = win32_message("MultiByteToWideChar(size)", GetLastError());
         return false;
     }
 
     utf16_text->resize(static_cast<std::size_t>(size));
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_text, utf8_length, utf16_text->data(), size) <= 0) {
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8_text, utf8_length, utf16_text->data(), size) <= 0) {
         *error = win32_message("MultiByteToWideChar(convert)", GetLastError());
         utf16_text->clear();
         return false;

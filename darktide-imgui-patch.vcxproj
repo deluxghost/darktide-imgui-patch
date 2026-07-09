@@ -79,6 +79,7 @@
     <ClInclude Include="src\imgui_atlas.h" />
     <ClInclude Include="src\imgui_patch_common.h" />
     <ClInclude Include="src\imgui_symbols.h" />
+    <ClInclude Include="src\input_patch.h" />
     <ClInclude Include="src\text_capture.h" />
     <ClInclude Include="src\writable_memory.h" />
   </ItemGroup>
@@ -92,6 +93,7 @@
     <ClCompile Include="src\imgui_atlas.cpp" />
     <ClCompile Include="src\imgui_patch_common.cpp" />
     <ClCompile Include="src\imgui_symbols.cpp" />
+    <ClCompile Include="src\input_patch.cpp" />
     <ClCompile Include="src\text_capture.cpp" />
     <ClCompile Include="src\writable_memory.cpp" />
   </ItemGroup>

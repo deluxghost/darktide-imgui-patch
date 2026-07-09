@@ -130,6 +130,8 @@ struct ResolvedImguiSymbols
     std::uintptr_t build_atlas = 0;
     std::uintptr_t calc_text_size = 0;
     std::uintptr_t render_text = 0;
+    std::uintptr_t add_input_character = 0;
+    std::uintptr_t win32_message_handler = 0;
     std::uintptr_t platform_get_clipboard_text_offset = 0;
     std::uintptr_t platform_set_clipboard_text_offset = 0;
 };

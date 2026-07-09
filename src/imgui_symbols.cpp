@@ -713,6 +713,139 @@ bool find_calc_text_size_symbol(const ImageSection& text_section, std::uintptr_t
     return true;
 }
 
+bool add_input_character_candidate_has_expected_body(const ImageSection& text_section, std::size_t offset)
+{
+    const std::size_t remaining = text_section.size - offset;
+    const std::size_t scan_size = std::min<std::size_t>(remaining, 0x100);
+    const unsigned char* bytes = text_section.begin + offset;
+
+    static constexpr unsigned char kAppAcceptingEventsCheck[] = {
+        0x80, 0xb9, 0xe5, 0x0b, 0x00, 0x00, 0x00,
+    };
+    static constexpr unsigned char kInputEventsQueueLoad[] = {
+        0x48, 0x8b, 0x99, 0xe0, 0x00, 0x00, 0x00,
+    };
+    static constexpr unsigned char kTextEventType[] = {
+        0xc7, 0x44, 0x24, 0x20, 0x06, 0x00, 0x00, 0x00,
+    };
+    static constexpr unsigned char kKeyboardEventSource[] = {
+        0xc7, 0x44, 0x24, 0x24, 0x02, 0x00, 0x00, 0x00,
+    };
+
+    return contains_bytes(bytes, scan_size, kAppAcceptingEventsCheck, sizeof(kAppAcceptingEventsCheck)) &&
+        contains_bytes(bytes, scan_size, kInputEventsQueueLoad, sizeof(kInputEventsQueueLoad)) &&
+        contains_bytes(bytes, scan_size, kTextEventType, sizeof(kTextEventType)) &&
+        contains_bytes(bytes, scan_size, kKeyboardEventSource, sizeof(kKeyboardEventSource));
+}
+
+bool find_add_input_character_symbol(const ImageSection& text_section, std::uintptr_t* add_input_character)
+{
+    static constexpr PatternByte kAddInputCharacterPattern[] = {
+        {0x85, false}, {0xd2, false}, {0x0f, false}, {0x84, false},
+        {0x00, true}, {0x00, true}, {0x00, true}, {0x00, true},
+        {0x53, false}, {0x48, false}, {0x83, false}, {0xec, false}, {0x40, false},
+    };
+
+    std::vector<std::uintptr_t> hits;
+    const std::size_t pattern_size = sizeof(kAddInputCharacterPattern) / sizeof(kAddInputCharacterPattern[0]);
+
+    if (text_section.size < pattern_size) {
+        set_last_error("Darktide .text section is too small for AddInputCharacter scan");
+        return false;
+    }
+
+    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
+        if (!matches_pattern(text_section.begin + offset, kAddInputCharacterPattern, pattern_size)) {
+            continue;
+        }
+
+        if (add_input_character_candidate_has_expected_body(text_section, offset)) {
+            hits.push_back(text_section.address + offset);
+        }
+    }
+
+    if (hits.size() != 1) {
+        char message[256] = {};
+        std::snprintf(message, sizeof(message), "AddInputCharacter signature scan found %zu candidates", hits.size());
+        set_last_error(message);
+        return false;
+    }
+
+    *add_input_character = hits[0];
+    return true;
+}
+
+bool win32_message_handler_candidate_has_expected_body(const ImageSection& text_section, std::size_t offset)
+{
+    const std::size_t remaining = text_section.size - offset;
+    const std::size_t scan_size = std::min<std::size_t>(remaining, 0xa20);
+    const unsigned char* bytes = text_section.begin + offset;
+
+    static constexpr unsigned char kBackendDataLoad[] = {
+        0x48, 0x8b, 0xb3, 0xa0, 0x00, 0x00, 0x00,
+    };
+    static constexpr unsigned char kMessageLimitCheck[] = {
+        0x81, 0xfa, 0x00, 0x02, 0x00, 0x00,
+    };
+    static constexpr unsigned char kKeyboardCodePageLoad[] = {
+        0x8b, 0x4e, 0x2c,
+    };
+    static constexpr unsigned char kMbcToWideCharSetup[] = {
+        0x44, 0x8b, 0xc8, 0x8b, 0xd0, 0x66, 0x89, 0x7d, 0x7f,
+    };
+    static constexpr unsigned char kInputEventsQueueLoadBody[] = {
+        0x48, 0x8b, 0x8b, 0xe0, 0x00, 0x00, 0x00,
+    };
+
+    return contains_bytes(bytes, scan_size, kBackendDataLoad, sizeof(kBackendDataLoad)) &&
+        contains_bytes(bytes, scan_size, kMessageLimitCheck, sizeof(kMessageLimitCheck)) &&
+        contains_bytes(bytes, scan_size, kKeyboardCodePageLoad, sizeof(kKeyboardCodePageLoad)) &&
+        contains_bytes(bytes, scan_size, kMbcToWideCharSetup, sizeof(kMbcToWideCharSetup)) &&
+        contains_bytes(bytes, scan_size, kInputEventsQueueLoadBody, sizeof(kInputEventsQueueLoadBody));
+}
+
+bool find_win32_message_handler_symbol(const ImageSection& text_section, std::uintptr_t* win32_message_handler)
+{
+    static constexpr PatternByte kWin32MessageHandlerPattern[] = {
+        {0x48, false}, {0x8b, false}, {0xc4, false}, {0x48, false}, {0x89, false},
+        {0x58, false}, {0x08, false}, {0x48, false}, {0x89, false}, {0x70, false},
+        {0x10, false}, {0x48, false}, {0x89, false}, {0x78, false}, {0x20, false},
+        {0x4c, false}, {0x89, false}, {0x40, false}, {0x18, false}, {0x55, false},
+        {0x41, false}, {0x54, false}, {0x41, false}, {0x55, false}, {0x41, false},
+        {0x56, false}, {0x41, false}, {0x57, false}, {0x48, false}, {0x8d, false},
+        {0x68, false}, {0xa9, false}, {0x48, false}, {0x81, false}, {0xec, false},
+        {0xa0, false}, {0x00, false}, {0x00, false}, {0x00, false},
+    };
+
+    std::vector<std::uintptr_t> hits;
+    const std::size_t pattern_size = sizeof(kWin32MessageHandlerPattern) / sizeof(kWin32MessageHandlerPattern[0]);
+
+    if (text_section.size < pattern_size) {
+        set_last_error("Darktide .text section is too small for Win32 message handler scan");
+        return false;
+    }
+
+    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
+        if (!matches_pattern(text_section.begin + offset, kWin32MessageHandlerPattern, pattern_size)) {
+            continue;
+        }
+
+        if (win32_message_handler_candidate_has_expected_body(text_section, offset)) {
+            hits.push_back(text_section.address + offset);
+        }
+    }
+
+    if (hits.size() != 1) {
+        char message[256] = {};
+        std::snprintf(message, sizeof(message), "Win32 message handler signature scan found %zu candidates", hits.size());
+        set_last_error(message);
+        return false;
+    }
+
+    *win32_message_handler = hits[0];
+    return true;
+}
+
 bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
 {
     if (symbols == nullptr) {
@@ -820,6 +953,16 @@ bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
         return false;
     }
 
+    std::uintptr_t add_input_character = 0;
+    if (!find_add_input_character_symbol(text_section, &add_input_character)) {
+        return false;
+    }
+
+    std::uintptr_t win32_message_handler = 0;
+    if (!find_win32_message_handler_symbol(text_section, &win32_message_handler)) {
+        return false;
+    }
+
     symbols->module_base = module_base;
     symbols->version_string = version_strings[0];
     symbols->version_pointer_slot = version_pointer_slots[0];
@@ -829,6 +972,8 @@ bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
     symbols->build_atlas = build_atlas;
     symbols->calc_text_size = calc_text_size;
     symbols->render_text = render_text;
+    symbols->add_input_character = add_input_character;
+    symbols->win32_message_handler = win32_message_handler;
     symbols->platform_get_clipboard_text_offset = platform_get_clipboard_text_offset;
     symbols->platform_set_clipboard_text_offset = platform_set_clipboard_text_offset;
     return true;
