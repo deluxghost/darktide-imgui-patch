@@ -4,11 +4,12 @@
 #include "glyph_cache.h"
 #include "imgui_atlas.h"
 #include "imgui_symbols.h"
-#include "writable_memory.h"
 
 #include <algorithm>
+#include <cwctype>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -23,6 +24,38 @@ std::uintptr_t g_installed_font_atlas = 0;
 std::uintptr_t g_base_font_atlas = 0;
 std::uintptr_t g_base_font = 0;
 std::wstring g_base_font_key;
+std::mutex g_font_file_cache_mutex;
+std::unordered_map<std::wstring, std::shared_ptr<const std::vector<unsigned char>>> g_font_file_cache;
+
+bool load_cached_font_bytes(
+    const std::wstring& path,
+    std::shared_ptr<const std::vector<unsigned char>>* bytes,
+    std::string* error)
+{
+    std::wstring key = path;
+    std::transform(key.begin(), key.end(), key.begin(), [](wchar_t value) {
+        return static_cast<wchar_t>(std::towlower(value));
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(g_font_file_cache_mutex);
+        const auto existing = g_font_file_cache.find(key);
+        if (existing != g_font_file_cache.end()) {
+            *bytes = existing->second;
+            return true;
+        }
+    }
+
+    auto loaded = std::make_shared<std::vector<unsigned char>>();
+    if (!read_file_bytes(path, loaded.get(), error)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_font_file_cache_mutex);
+    const auto stored = g_font_file_cache.emplace(key, loaded).first;
+    *bytes = stored->second;
+    return true;
+}
 
 bool prepare_system_base_font(InstalledFont* font, std::string* error)
 {
@@ -40,7 +73,7 @@ bool prepare_system_base_font(InstalledFont* font, std::string* error)
     font->family_name = base_font.family_name;
     font->face_index = base_font.face_index;
 
-    return read_file_bytes(font->path, &font->bytes, error);
+    return load_cached_font_bytes(font->path, &font->bytes, error);
 }
 
 bool read_runtime_font_atlas(std::uintptr_t context, AtlasProbe* probe)
@@ -196,7 +229,7 @@ PreparedFontBatch prepare_font_batch_for_text(const std::string& utf8_text)
         font.family_name = font_ref.family_name;
         font.face_index = font_ref.face_index;
 
-        if (!read_file_bytes(font.path, &font.bytes, &error)) {
+        if (!load_cached_font_bytes(font.path, &font.bytes, &error)) {
             batch.error = error;
             return batch;
         }

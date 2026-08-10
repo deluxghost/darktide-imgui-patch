@@ -181,8 +181,8 @@ void initialize_font_config(
 {
     std::memset(config, 0, sizeof(*config));
     std::snprintf(config->name, sizeof(config->name), "%s", source_name.c_str());
-    config->font_data = const_cast<unsigned char*>(font.bytes.data());
-    config->font_data_size = static_cast<int>(font.bytes.size());
+    config->font_data = const_cast<unsigned char*>(font.bytes->data());
+    config->font_data_size = static_cast<int>(font.bytes->size());
     config->font_data_owned_by_atlas = false;
     config->merge_mode = merge_mode;
     config->oversample_h = 0;

@@ -1,6 +1,5 @@
 #include "glyph_cache.h"
 
-#include "writable_memory.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -41,7 +40,7 @@ std::size_t clear_missing_glyph_cache_for_baked_font(std::uintptr_t baked_font)
     const int entry_count = std::min(advance_size, lookup_size);
     const auto advance_bytes = static_cast<std::size_t>(entry_count) * sizeof(float);
     const auto lookup_bytes = static_cast<std::size_t>(entry_count) * sizeof(std::uint16_t);
-    if (!is_writable_memory(advance_data, advance_bytes) || !is_writable_memory(lookup_data, lookup_bytes)) {
+    if (!is_writable(advance_data, advance_bytes) || !is_writable(lookup_data, lookup_bytes)) {
         return 0;
     }
 

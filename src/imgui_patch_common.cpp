@@ -1,7 +1,8 @@
 #include "imgui_patch_common.h"
 
+#include "dtintutils.h"
+
 #include <algorithm>
-#include <cstdarg>
 #include <cstdio>
 #include <cwctype>
 #include <climits>
@@ -24,56 +25,14 @@ void set_last_error(const std::string& message)
     set_last_error(message.c_str());
 }
 
-bool is_readable_protect(DWORD protect)
-{
-    if ((protect & PAGE_GUARD) != 0 || (protect & PAGE_NOACCESS) != 0) {
-        return false;
-    }
-
-    switch (protect & 0xff) {
-    case PAGE_READONLY:
-    case PAGE_READWRITE:
-    case PAGE_WRITECOPY:
-    case PAGE_EXECUTE_READ:
-    case PAGE_EXECUTE_READWRITE:
-    case PAGE_EXECUTE_WRITECOPY:
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool is_readable(const void* address, std::size_t size)
 {
-    if (address == nullptr || size == 0) {
-        return false;
-    }
+    return dtintutils_is_readable_range(address, size) != 0;
+}
 
-    const auto start = reinterpret_cast<std::uintptr_t>(address);
-    const auto end = start + size;
-    if (end < start) {
-        return false;
-    }
-
-    auto current = start;
-    while (current < end) {
-        MEMORY_BASIC_INFORMATION info = {};
-        if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0) {
-            return false;
-        }
-        if (info.State != MEM_COMMIT || !is_readable_protect(info.Protect)) {
-            return false;
-        }
-
-        const auto region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
-        if (region_end <= current) {
-            return false;
-        }
-
-        current = region_end;
-    }
-
-    return true;
+bool is_writable(std::uintptr_t address, std::size_t size)
+{
+    return dtintutils_is_writable_range(reinterpret_cast<const void*>(address), size) != 0;
 }
 
 bool read_c_string(std::uintptr_t address, char* buffer, std::size_t buffer_size)
@@ -98,28 +57,6 @@ bool read_c_string(std::uintptr_t address, char* buffer, std::size_t buffer_size
     }
 
     buffer[buffer_size - 1] = '\0';
-    return true;
-}
-
-bool append(char** cursor, int* remaining, const char* format, ...)
-{
-    if (*remaining <= 0) {
-        set_last_error("output buffer is full");
-        return false;
-    }
-
-    va_list args;
-    va_start(args, format);
-    const int written = std::vsnprintf(*cursor, static_cast<std::size_t>(*remaining), format, args);
-    va_end(args);
-
-    if (written < 0 || written >= *remaining) {
-        set_last_error("output buffer is too small");
-        return false;
-    }
-
-    *cursor += written;
-    *remaining -= written;
     return true;
 }
 

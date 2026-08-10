@@ -19,6 +19,28 @@ namespace
 {
 constexpr std::size_t kMaxCapturedTextsPerBatch = 64;
 
+enum ConfigureStatus
+{
+    kConfigureError = -1,
+    kConfigureAtlasLocked = 0,
+    kConfigureApplied = 1,
+};
+
+enum CaptureStatus
+{
+    kCaptureError = -1,
+    kCaptureIdle = 0,
+    kCapturePending = 1,
+    kCapturePreparing = 2,
+    kCaptureAtlasLocked = 3,
+    kCaptureApplied = 4,
+    kCaptureNotInstalled = 5,
+};
+
+std::mutex g_configure_mutex;
+bool g_configure_prepared = false;
+PreparedFontBatch g_configure_batch;
+
 std::mutex g_capture_mutex;
 std::future<PreparedFontBatch> g_capture_future;
 bool g_capture_active = false;
@@ -47,18 +69,6 @@ std::string join_captured_texts(const std::vector<std::string>& texts)
     return result;
 }
 
-bool write_status(char* output_buffer, int output_buffer_size, const char* name, const char* value)
-{
-    if (output_buffer == nullptr || output_buffer_size <= 0) {
-        set_last_error("invalid output buffer");
-        return false;
-    }
-
-    output_buffer[0] = '\0';
-    char* cursor = output_buffer;
-    int remaining = output_buffer_size;
-    return append(&cursor, &remaining, "%s=%s\n", name, value);
-}
 }
 }
 
@@ -67,7 +77,7 @@ extern "C" __declspec(dllexport) const char* ImguiPatch_LastError()
     return imgui_patch::g_last_error;
 }
 
-extern "C" __declspec(dllexport) int ImguiPatch_ConfigureFonts(char* output_buffer, int output_buffer_size)
+extern "C" __declspec(dllexport) int ImguiPatch_ConfigureFonts()
 {
     using namespace imgui_patch;
 
@@ -75,39 +85,44 @@ extern "C" __declspec(dllexport) int ImguiPatch_ConfigureFonts(char* output_buff
         set_last_error("");
 
         if (!install_clipboard_patch()) {
-            return 0;
+            return kConfigureError;
         }
 
         if (!install_input_patch()) {
-            return 0;
+            return kConfigureError;
         }
 
-        PreparedFontBatch batch = prepare_base_font_batch();
-        if (!batch.error.empty()) {
-            set_last_error(batch.error);
-            return 0;
+        std::lock_guard<std::mutex> lock(g_configure_mutex);
+        if (!g_configure_prepared) {
+            g_configure_batch = prepare_base_font_batch();
+            g_configure_prepared = true;
         }
-
+        if (!g_configure_batch.error.empty()) {
+            set_last_error(g_configure_batch.error);
+            g_configure_batch = {};
+            g_configure_prepared = false;
+            return kConfigureError;
+        }
         FontBatchApplyResult apply_result;
-        if (!apply_prepared_font_batch(&batch, kDefaultFontSizePixels, &apply_result)) {
-            return 0;
+        if (!apply_prepared_font_batch(&g_configure_batch, kDefaultFontSizePixels, &apply_result)) {
+            return kConfigureError;
         }
-
-        return write_status(
-            output_buffer,
-            output_buffer_size,
-            "configure_status",
-            apply_result.atlas_locked ? "atlas_locked" : "applied") ? 1 : 0;
+        if (apply_result.atlas_locked) {
+            return kConfigureAtlasLocked;
+        }
+        g_configure_batch = {};
+        g_configure_prepared = false;
+        return kConfigureApplied;
     } catch (const std::exception& error) {
         set_last_error(std::string("native exception: ") + error.what());
-        return 0;
+        return kConfigureError;
     } catch (...) {
         set_last_error("unknown native exception");
-        return 0;
+        return kConfigureError;
     }
 }
 
-extern "C" __declspec(dllexport) int ImguiPatch_InstallTextCapture(char* output_buffer, int output_buffer_size)
+extern "C" __declspec(dllexport) int ImguiPatch_InstallTextCapture()
 {
     using namespace imgui_patch;
 
@@ -118,7 +133,7 @@ extern "C" __declspec(dllexport) int ImguiPatch_InstallTextCapture(char* output_
             return 0;
         }
 
-        return write_status(output_buffer, output_buffer_size, "capture_status", "installed") ? 1 : 0;
+        return 1;
     } catch (const std::exception& error) {
         set_last_error(std::string("native exception: ") + error.what());
         return 0;
@@ -128,7 +143,7 @@ extern "C" __declspec(dllexport) int ImguiPatch_InstallTextCapture(char* output_
     }
 }
 
-extern "C" __declspec(dllexport) int ImguiPatch_PollTextCapture(char* output_buffer, int output_buffer_size)
+extern "C" __declspec(dllexport) int ImguiPatch_PollTextCapture()
 {
     using namespace imgui_patch;
 
@@ -136,7 +151,7 @@ extern "C" __declspec(dllexport) int ImguiPatch_PollTextCapture(char* output_buf
         set_last_error("");
 
         if (!is_text_capture_installed()) {
-            return write_status(output_buffer, output_buffer_size, "capture_status", "not_installed") ? 1 : 0;
+            return kCaptureNotInstalled;
         }
 
         std::lock_guard<std::mutex> lock(g_capture_mutex);
@@ -144,11 +159,11 @@ extern "C" __declspec(dllexport) int ImguiPatch_PollTextCapture(char* output_buf
             if (!g_capture_future.valid()) {
                 set_last_error("text capture font preparation future is invalid");
                 reset_capture_preparation();
-                return 0;
+                return kCaptureError;
             }
 
             if (g_capture_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-                return write_status(output_buffer, output_buffer_size, "capture_status", "pending") ? 1 : 0;
+                return kCapturePending;
             }
 
             g_capture_batch = g_capture_future.get();
@@ -159,29 +174,29 @@ extern "C" __declspec(dllexport) int ImguiPatch_PollTextCapture(char* output_buf
             if (!g_capture_batch.error.empty()) {
                 set_last_error(g_capture_batch.error);
                 reset_capture_preparation();
-                return 0;
+                return kCaptureError;
             }
 
             FontBatchApplyResult apply_result;
             if (!apply_prepared_font_batch(&g_capture_batch, 0.0f, &apply_result)) {
-                return 0;
+                return kCaptureError;
             }
 
             if (apply_result.atlas_locked) {
-                return write_status(output_buffer, output_buffer_size, "capture_status", "atlas_locked") ? 1 : 0;
+                return kCaptureAtlasLocked;
             }
 
             reset_capture_preparation();
-            return write_status(output_buffer, output_buffer_size, "capture_status", "applied") ? 1 : 0;
+            return kCaptureApplied;
         }
 
         CapturedTextBatch captured;
         if (!pop_captured_text_batch(kMaxCapturedTextsPerBatch, &captured)) {
-            return 0;
+            return kCaptureError;
         }
 
         if (captured.texts.empty()) {
-            return write_status(output_buffer, output_buffer_size, "capture_status", "idle") ? 1 : 0;
+            return kCaptureIdle;
         }
 
         const std::string text = join_captured_texts(captured.texts);
@@ -192,17 +207,17 @@ extern "C" __declspec(dllexport) int ImguiPatch_PollTextCapture(char* output_buf
             return prepare_font_batch_for_text(text);
         });
 
-        return write_status(output_buffer, output_buffer_size, "capture_status", "preparing") ? 1 : 0;
+        return kCapturePreparing;
     } catch (const std::exception& error) {
         set_last_error(std::string("native exception: ") + error.what());
-        return 0;
+        return kCaptureError;
     } catch (...) {
         set_last_error("unknown native exception");
-        return 0;
+        return kCaptureError;
     }
 }
 
-extern "C" __declspec(dllexport) int ImguiPatch_UninstallTextCapture(char* output_buffer, int output_buffer_size)
+extern "C" __declspec(dllexport) int ImguiPatch_UninstallTextCapture()
 {
     using namespace imgui_patch;
 
@@ -218,7 +233,7 @@ extern "C" __declspec(dllexport) int ImguiPatch_UninstallTextCapture(char* outpu
             return 0;
         }
 
-        return write_status(output_buffer, output_buffer_size, "capture_status", "uninstalled") ? 1 : 0;
+        return 1;
     } catch (const std::exception& error) {
         set_last_error(std::string("native exception: ") + error.what());
         return 0;

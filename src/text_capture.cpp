@@ -1,11 +1,9 @@
 #include "text_capture.h"
 
+#include "dtintutils.h"
 #include "imgui_symbols.h"
 
 #include <algorithm>
-#include <array>
-#include <cstdio>
-#include <cstring>
 #include <deque>
 #include <mutex>
 #include <unordered_set>
@@ -50,74 +48,25 @@ using CalcTextSizeFn = float* (__fastcall*)(
     const char* text_end,
     void* remaining);
 
-constexpr std::size_t kAbsoluteJumpSize = 14;
-constexpr std::size_t kCalcTextSizePatchSize = 16;
-constexpr std::size_t kRenderTextPatchSize = 17;
-constexpr std::size_t kMaxPatchSize = 32;
 constexpr std::size_t kMaxCapturedTextBytes = 4096;
 constexpr std::size_t kMaxQueuedTexts = 512;
 
-struct DetourState
-{
-    std::uintptr_t target = 0;
-    void* trampoline = nullptr;
-    std::array<unsigned char, kMaxPatchSize> original_bytes = {};
-    std::size_t patch_size = 0;
-};
-
 std::mutex g_detour_mutex;
-DetourState g_calc_text_size_detour;
-DetourState g_render_text_detour;
-CalcTextSizeFn g_original_calc_text_size = nullptr;
-RenderTextFn g_original_render_text = nullptr;
+DtIntUtilsHook g_calc_text_size_hook;
+DtIntUtilsHook g_render_text_hook;
 bool g_capture_installed = false;
 
 std::mutex g_queue_mutex;
 std::deque<std::string> g_text_queue;
-std::unordered_set<std::string> g_seen_texts;
+std::unordered_set<std::uint32_t> g_seen_codepoints;
 
-void write_absolute_jump(unsigned char* target, const void* destination)
+bool read_text_range(const char* text_begin, const char* text_end, std::size_t* length)
 {
-    target[0] = 0xff;
-    target[1] = 0x25;
-    target[2] = 0x00;
-    target[3] = 0x00;
-    target[4] = 0x00;
-    target[5] = 0x00;
-
-    const auto destination_address = reinterpret_cast<std::uintptr_t>(destination);
-    std::memcpy(target + 6, &destination_address, sizeof(destination_address));
-}
-
-bool render_text_has_expected_prologue(const unsigned char* target)
-{
-    static constexpr unsigned char kExpectedPrefix[] = {
-        0x4c, 0x8b, 0xdc, 0x4d, 0x89, 0x4b, 0x20, 0xf3, 0x0f,
-        0x11, 0x54, 0x24, 0x18, 0x49, 0x89, 0x53, 0x10,
-    };
-
-    return std::memcmp(target, kExpectedPrefix, sizeof(kExpectedPrefix)) == 0;
-}
-
-bool calc_text_size_has_expected_prologue(const unsigned char* target)
-{
-    static constexpr unsigned char kExpectedPrefix[] = {
-        0x48, 0x8b, 0xc4, 0x48, 0x89, 0x48, 0x08, 0x53,
-        0x56, 0x48, 0x81, 0xec,
-    };
-
-    return std::memcmp(target, kExpectedPrefix, sizeof(kExpectedPrefix)) == 0;
-}
-
-bool read_text_range(const char* text_begin, const char* text_end, std::string* text)
-{
-    text->clear();
-
-    if (text_begin == nullptr) {
+    if (text_begin == nullptr || length == nullptr) {
         return false;
     }
 
-    std::size_t length = 0;
+    *length = 0;
     if (text_end != nullptr) {
         const auto begin = reinterpret_cast<std::uintptr_t>(text_begin);
         const auto end = reinterpret_cast<std::uintptr_t>(text_end);
@@ -125,21 +74,19 @@ bool read_text_range(const char* text_begin, const char* text_end, std::string* 
             return false;
         }
 
-        length = static_cast<std::size_t>(end - begin);
+        *length = static_cast<std::size_t>(end - begin);
     } else {
-        while (length < kMaxCapturedTextBytes && text_begin[length] != '\0') {
-            ++length;
+        while (*length < kMaxCapturedTextBytes && text_begin[*length] != '\0') {
+            ++*length;
         }
     }
-
-    text->assign(text_begin, length);
     return true;
 }
 
-bool contains_non_ascii_text(const std::string& text)
+bool contains_non_ascii_text(const char* text, std::size_t length)
 {
-    for (unsigned char byte : text) {
-        if (byte >= 0x80) {
+    for (std::size_t index = 0; index < length; ++index) {
+        if (static_cast<unsigned char>(text[index]) >= 0x80) {
             return true;
         }
     }
@@ -147,14 +94,52 @@ bool contains_non_ascii_text(const std::string& text)
     return false;
 }
 
+std::size_t decode_utf8_codepoint(
+    const unsigned char* text,
+    std::size_t remaining,
+    std::uint32_t* codepoint)
+{
+    const unsigned char first = text[0];
+    if (first < 0x80) {
+        *codepoint = first;
+        return 1;
+    }
+    if (first >= 0xc2 && first <= 0xdf && remaining >= 2 &&
+        (text[1] & 0xc0) == 0x80) {
+        *codepoint = ((first & 0x1f) << 6) | (text[1] & 0x3f);
+        return 2;
+    }
+    if (first >= 0xe0 && first <= 0xef && remaining >= 3 &&
+        (text[1] & 0xc0) == 0x80 && (text[2] & 0xc0) == 0x80 &&
+        !(first == 0xe0 && text[1] < 0xa0) &&
+        !(first == 0xed && text[1] >= 0xa0)) {
+        *codepoint = ((first & 0x0f) << 12) |
+            ((text[1] & 0x3f) << 6) |
+            (text[2] & 0x3f);
+        return 3;
+    }
+    if (first >= 0xf0 && first <= 0xf4 && remaining >= 4 &&
+        (text[1] & 0xc0) == 0x80 && (text[2] & 0xc0) == 0x80 &&
+        (text[3] & 0xc0) == 0x80 &&
+        !(first == 0xf0 && text[1] < 0x90) &&
+        !(first == 0xf4 && text[1] >= 0x90)) {
+        *codepoint = ((first & 0x07) << 18) |
+            ((text[1] & 0x3f) << 12) |
+            ((text[2] & 0x3f) << 6) |
+            (text[3] & 0x3f);
+        return 4;
+    }
+    return 0;
+}
+
 void enqueue_rendered_text(const char* text_begin, const char* text_end)
 {
-    std::string text;
-    if (!read_text_range(text_begin, text_end, &text)) {
+    std::size_t length = 0;
+    if (!read_text_range(text_begin, text_end, &length)) {
         return;
     }
 
-    if (text.empty() || !contains_non_ascii_text(text)) {
+    if (length == 0 || !contains_non_ascii_text(text_begin, length)) {
         return;
     }
 
@@ -163,16 +148,29 @@ void enqueue_rendered_text(const char* text_begin, const char* text_end)
         return;
     }
 
-    if (g_seen_texts.find(text) != g_seen_texts.end()) {
-        return;
-    }
-
     if (g_text_queue.size() >= kMaxQueuedTexts) {
         return;
     }
 
-    g_seen_texts.insert(text);
-    g_text_queue.push_back(std::move(text));
+    std::string new_codepoints;
+    new_codepoints.reserve(length);
+    const auto* bytes = reinterpret_cast<const unsigned char*>(text_begin);
+    for (std::size_t offset = 0; offset < length;) {
+        std::uint32_t codepoint = 0;
+        const std::size_t sequence_length = decode_utf8_codepoint(
+            bytes + offset, length - offset, &codepoint);
+        if (sequence_length == 0) {
+            ++offset;
+            continue;
+        }
+        if (codepoint >= 0x80 && g_seen_codepoints.insert(codepoint).second) {
+            new_codepoints.append(text_begin + offset, sequence_length);
+        }
+        offset += sequence_length;
+    }
+    if (!new_codepoints.empty()) {
+        g_text_queue.push_back(std::move(new_codepoints));
+    }
 }
 
 void __fastcall render_text_hook(
@@ -192,7 +190,7 @@ void __fastcall render_text_hook(
     } catch (...) {
     }
 
-    const RenderTextFn original = g_original_render_text;
+    const auto original = reinterpret_cast<RenderTextFn>(g_render_text_hook.trampoline);
     if (original != nullptr) {
         original(font, draw_list, size, pos, col, clip_rect, text_begin, text_end, wrap_width, flags);
     }
@@ -213,7 +211,7 @@ float* __fastcall calc_text_size_hook(
     } catch (...) {
     }
 
-    const CalcTextSizeFn original = g_original_calc_text_size;
+    const auto original = reinterpret_cast<CalcTextSizeFn>(g_calc_text_size_hook.trampoline);
     if (original != nullptr) {
         return original(font, out, size, max_width, wrap_width, text_begin, text_end, remaining);
     }
@@ -221,103 +219,11 @@ float* __fastcall calc_text_size_hook(
     return out;
 }
 
-bool create_trampoline(DetourState* detour)
-{
-    if (detour->trampoline != nullptr) {
-        return true;
-    }
-
-    const std::size_t trampoline_size = detour->patch_size + kAbsoluteJumpSize;
-    void* trampoline = VirtualAlloc(nullptr, trampoline_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (trampoline == nullptr) {
-        set_last_error(win32_message("VirtualAlloc(trampoline)", GetLastError()));
-        return false;
-    }
-
-    auto* trampoline_bytes = reinterpret_cast<unsigned char*>(trampoline);
-    std::memcpy(trampoline_bytes, reinterpret_cast<const void*>(detour->target), detour->patch_size);
-    write_absolute_jump(trampoline_bytes + detour->patch_size, reinterpret_cast<const void*>(detour->target + detour->patch_size));
-    FlushInstructionCache(GetCurrentProcess(), trampoline, trampoline_size);
-
-    detour->trampoline = trampoline;
-    return true;
-}
-
-bool install_detour(
-    DetourState* detour,
-    std::uintptr_t target_address,
-    std::size_t patch_size,
-    const void* hook,
-    bool (*validate_prologue)(const unsigned char*),
-    const char* name)
-{
-    if (patch_size < kAbsoluteJumpSize || patch_size > kMaxPatchSize) {
-        set_last_error("invalid detour patch size");
-        return false;
-    }
-
-    auto* target = reinterpret_cast<unsigned char*>(target_address);
-    if (!validate_prologue(target)) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "resolved %s prologue did not match the expected hook patch bytes", name);
-        set_last_error(message);
-        return false;
-    }
-
-    detour->target = target_address;
-    detour->patch_size = patch_size;
-    std::memcpy(detour->original_bytes.data(), target, patch_size);
-
-    if (!create_trampoline(detour)) {
-        return false;
-    }
-
-    DWORD old_protect = 0;
-    if (!VirtualProtect(target, patch_size, PAGE_EXECUTE_READWRITE, &old_protect)) {
-        set_last_error(win32_message("VirtualProtect(detour)", GetLastError()));
-        return false;
-    }
-
-    unsigned char patch[kMaxPatchSize] = {};
-    write_absolute_jump(patch, hook);
-    std::memset(patch + kAbsoluteJumpSize, 0x90, patch_size - kAbsoluteJumpSize);
-    std::memcpy(target, patch, patch_size);
-
-    DWORD ignored = 0;
-    VirtualProtect(target, patch_size, old_protect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), target, patch_size);
-    return true;
-}
-
-bool restore_detour(DetourState* detour, const char* name)
-{
-    if (detour->target == 0) {
-        return true;
-    }
-
-    auto* target = reinterpret_cast<unsigned char*>(detour->target);
-    DWORD old_protect = 0;
-    if (!VirtualProtect(target, detour->patch_size, PAGE_EXECUTE_READWRITE, &old_protect)) {
-        char operation[128] = {};
-        std::snprintf(operation, sizeof(operation), "VirtualProtect(%s restore)", name);
-        set_last_error(win32_message(operation, GetLastError()));
-        return false;
-    }
-
-    std::memcpy(target, detour->original_bytes.data(), detour->patch_size);
-
-    DWORD ignored = 0;
-    VirtualProtect(target, detour->patch_size, old_protect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), target, detour->patch_size);
-    detour->target = 0;
-    return true;
-}
-
 void clear_captured_texts()
 {
     std::lock_guard<std::mutex> lock(g_queue_mutex);
     g_text_queue.clear();
-    g_seen_texts.clear();
+    g_seen_codepoints.clear();
 }
 }
 
@@ -346,31 +252,49 @@ bool install_text_capture()
 
     clear_captured_texts();
 
-    if (!install_detour(
-            &g_calc_text_size_detour,
-            symbols.calc_text_size,
-            kCalcTextSizePatchSize,
-            reinterpret_cast<const void*>(&calc_text_size_hook),
-            calc_text_size_has_expected_prologue,
-            "CalcTextSize")) {
+    static constexpr unsigned char kCalcTextSizeExpectedPrefix[] = {
+        0x48, 0x8b, 0xc4, 0x48, 0x89, 0x48, 0x08, 0x53,
+        0x56, 0x48, 0x81, 0xec,
+    };
+    static constexpr unsigned char kRenderTextExpectedPrefix[] = {
+        0x4c, 0x8b, 0xdc, 0x4d, 0x89, 0x4b, 0x20, 0xf3, 0x0f,
+        0x11, 0x54, 0x24, 0x18, 0x49, 0x89, 0x53, 0x10,
+    };
+    DtIntUtilsPatternByte calc_text_size_expected[sizeof(kCalcTextSizeExpectedPrefix)] = {};
+    DtIntUtilsPatternByte render_text_expected[sizeof(kRenderTextExpectedPrefix)] = {};
+    for (std::size_t index = 0; index < sizeof(kCalcTextSizeExpectedPrefix); ++index) {
+        calc_text_size_expected[index].value = kCalcTextSizeExpectedPrefix[index];
+    }
+    for (std::size_t index = 0; index < sizeof(kRenderTextExpectedPrefix); ++index) {
+        render_text_expected[index].value = kRenderTextExpectedPrefix[index];
+    }
+    const DtIntUtilsHookRequest requests[] = {
+        {
+            &g_calc_text_size_hook,
+            reinterpret_cast<void*>(symbols.calc_text_size),
+            reinterpret_cast<void*>(&calc_text_size_hook),
+            calc_text_size_expected,
+            sizeof(calc_text_size_expected) / sizeof(calc_text_size_expected[0]),
+        },
+        {
+            &g_render_text_hook,
+            reinterpret_cast<void*>(symbols.render_text),
+            reinterpret_cast<void*>(&render_text_hook),
+            render_text_expected,
+            sizeof(render_text_expected) / sizeof(render_text_expected[0]),
+        },
+    };
+    char utility_error[512] = {};
+
+    if (!dtintutils_hooks_install(
+            requests,
+            sizeof(requests) / sizeof(requests[0]),
+            utility_error,
+            sizeof(utility_error))) {
+        set_last_error(utility_error);
         return false;
     }
 
-    g_original_calc_text_size = reinterpret_cast<CalcTextSizeFn>(g_calc_text_size_detour.trampoline);
-
-    if (!install_detour(
-            &g_render_text_detour,
-            symbols.render_text,
-            kRenderTextPatchSize,
-            reinterpret_cast<const void*>(&render_text_hook),
-            render_text_has_expected_prologue,
-            "RenderText")) {
-        restore_detour(&g_calc_text_size_detour, "CalcTextSize");
-        g_original_calc_text_size = nullptr;
-        return false;
-    }
-
-    g_original_render_text = reinterpret_cast<RenderTextFn>(g_render_text_detour.trampoline);
     g_capture_installed = true;
     return true;
 }
@@ -384,16 +308,17 @@ bool uninstall_text_capture()
         return true;
     }
 
-    if (!restore_detour(&g_render_text_detour, "RenderText")) {
+    char utility_error[512] = {};
+    if (!dtintutils_hook_remove(&g_render_text_hook, utility_error, sizeof(utility_error))) {
+        set_last_error(utility_error);
         return false;
     }
 
-    if (!restore_detour(&g_calc_text_size_detour, "CalcTextSize")) {
+    if (!dtintutils_hook_remove(&g_calc_text_size_hook, utility_error, sizeof(utility_error))) {
+        set_last_error(utility_error);
         return false;
     }
 
-    g_original_render_text = nullptr;
-    g_original_calc_text_size = nullptr;
     g_capture_installed = false;
     clear_captured_texts();
     return true;

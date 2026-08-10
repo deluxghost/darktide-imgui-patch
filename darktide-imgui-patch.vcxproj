@@ -45,7 +45,7 @@
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)..\darktide-internal-utils\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -81,7 +81,6 @@
     <ClInclude Include="src\imgui_symbols.h" />
     <ClInclude Include="src\input_patch.h" />
     <ClInclude Include="src\text_capture.h" />
-    <ClInclude Include="src\writable_memory.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\clipboard_patch.cpp" />
@@ -95,10 +94,15 @@
     <ClCompile Include="src\imgui_symbols.cpp" />
     <ClCompile Include="src\input_patch.cpp" />
     <ClCompile Include="src\text_capture.cpp" />
-    <ClCompile Include="src\writable_memory.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\versioninfo.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\darktide-internal-utils\dtintutils-core.vcxproj">
+      <Project>{A2A708A8-2106-443F-9293-FBF44E582D2E}</Project>
+      <LinkLibraryDependencies>true</LinkLibraryDependencies>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

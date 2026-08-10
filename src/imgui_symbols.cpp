@@ -1,5 +1,7 @@
 #include "imgui_symbols.h"
 
+#include "dtintutils.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -11,264 +13,22 @@ namespace
 {
 constexpr char kDearImguiPrefix[] = "Dear ImGui ";
 
-struct ImageSection
-{
-    const unsigned char* begin = nullptr;
-    std::uintptr_t address = 0;
-    std::size_t size = 0;
-    DWORD characteristics = 0;
-    char name[9] = {};
-};
-
-struct PatternByte
-{
-    unsigned char value;
-    bool wildcard;
-};
+using ImageSection = DtIntUtilsSection;
+using PatternByte = DtIntUtilsPatternByte;
 
 std::mutex g_symbol_mutex;
 bool g_symbols_resolved = false;
 ResolvedImguiSymbols g_symbols;
 
-bool section_name_equals(const ImageSection& section, const char* name)
-{
-    return std::strncmp(section.name, name, sizeof(section.name)) == 0;
-}
-
 bool address_in_section(const ImageSection& section, std::uintptr_t address)
 {
-    return address >= section.address && address < section.address + section.size;
+    const auto begin = reinterpret_cast<std::uintptr_t>(section.start);
+    return address >= begin && address < begin + section.size;
 }
 
-bool address_in_any_writable_section(const std::vector<ImageSection>& sections, std::uintptr_t address)
+bool address_in_any_writable_section(const DtIntUtilsModule& module, std::uintptr_t address)
 {
-    for (const ImageSection& section : sections) {
-        if ((section.characteristics & IMAGE_SCN_MEM_WRITE) != 0 && address_in_section(section, address)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool get_image_sections(std::uintptr_t module_base, std::vector<ImageSection>* sections)
-{
-    if (module_base == 0 || sections == nullptr) {
-        set_last_error("invalid module base");
-        return false;
-    }
-
-    const auto dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(module_base);
-    if (dos_header->e_magic != IMAGE_DOS_SIGNATURE) {
-        set_last_error("Darktide module has invalid DOS header");
-        return false;
-    }
-
-    const auto nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(module_base + static_cast<std::uintptr_t>(dos_header->e_lfanew));
-    if (nt_headers->Signature != IMAGE_NT_SIGNATURE) {
-        set_last_error("Darktide module has invalid NT header");
-        return false;
-    }
-
-    const auto image_end = module_base + nt_headers->OptionalHeader.SizeOfImage;
-    const IMAGE_SECTION_HEADER* section_header = IMAGE_FIRST_SECTION(nt_headers);
-
-    sections->clear();
-    sections->reserve(nt_headers->FileHeader.NumberOfSections);
-
-    for (WORD index = 0; index < nt_headers->FileHeader.NumberOfSections; ++index) {
-        const IMAGE_SECTION_HEADER& native_section = section_header[index];
-        const auto section_address = module_base + native_section.VirtualAddress;
-        std::size_t section_size = std::max<std::size_t>(native_section.Misc.VirtualSize, native_section.SizeOfRawData);
-        if (section_address >= image_end || section_size == 0) {
-            continue;
-        }
-
-        if (section_address + section_size > image_end) {
-            section_size = image_end - section_address;
-        }
-
-        ImageSection section = {};
-        section.begin = reinterpret_cast<const unsigned char*>(section_address);
-        section.address = section_address;
-        section.size = section_size;
-        section.characteristics = native_section.Characteristics;
-        std::memcpy(section.name, native_section.Name, IMAGE_SIZEOF_SHORT_NAME);
-        section.name[IMAGE_SIZEOF_SHORT_NAME] = '\0';
-        sections->push_back(section);
-    }
-
-    return true;
-}
-
-bool find_section(const std::vector<ImageSection>& sections, const char* name, ImageSection* section)
-{
-    for (const ImageSection& candidate : sections) {
-        if (section_name_equals(candidate, name)) {
-            *section = candidate;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool read_unaligned_i32(const unsigned char* address, std::int32_t* value)
-{
-    if (address == nullptr || value == nullptr) {
-        return false;
-    }
-
-    std::memcpy(value, address, sizeof(*value));
-    return true;
-}
-
-bool read_unaligned_pointer(const unsigned char* address, std::uintptr_t* value)
-{
-    if (address == nullptr || value == nullptr) {
-        return false;
-    }
-
-    std::memcpy(value, address, sizeof(*value));
-    return true;
-}
-
-bool resolve_rip_relative_target(const unsigned char* instruction, std::uintptr_t instruction_address, std::uintptr_t* target)
-{
-    if (instruction == nullptr || target == nullptr) {
-        return false;
-    }
-
-    if (!((instruction[0] == 0x48 || instruction[0] == 0x4c) &&
-          (instruction[1] == 0x8b || instruction[1] == 0x8d || instruction[1] == 0x89) &&
-          ((instruction[2] & 0xc7) == 0x05))) {
-        return false;
-    }
-
-    std::int32_t displacement = 0;
-    if (!read_unaligned_i32(instruction + 3, &displacement)) {
-        return false;
-    }
-
-    *target = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(instruction_address + 7) + displacement);
-    return true;
-}
-
-void find_rip_relative_references(
-    const ImageSection& text_section,
-    std::uintptr_t target,
-    std::vector<std::uintptr_t>* references)
-{
-    references->clear();
-
-    if (text_section.size < 7) {
-        return;
-    }
-
-    for (std::size_t offset = 0; offset <= text_section.size - 7; ++offset) {
-        const auto instruction = text_section.begin + offset;
-        const auto instruction_address = text_section.address + offset;
-
-        std::uintptr_t resolved_target = 0;
-        if (!resolve_rip_relative_target(instruction, instruction_address, &resolved_target)) {
-            continue;
-        }
-
-        if (resolved_target == target) {
-            references->push_back(instruction_address);
-        }
-    }
-}
-
-void find_ascii_prefix_in_section(const ImageSection& section, const char* prefix, std::vector<std::uintptr_t>* addresses)
-{
-    addresses->clear();
-
-    const std::size_t prefix_length = std::strlen(prefix);
-    if (prefix_length == 0 || section.size < prefix_length) {
-        return;
-    }
-
-    for (std::size_t offset = 0; offset <= section.size - prefix_length; ++offset) {
-        if (std::memcmp(section.begin + offset, prefix, prefix_length) != 0) {
-            continue;
-        }
-
-        addresses->push_back(section.address + offset);
-    }
-}
-
-void find_pointer_slots_to(
-    const std::vector<ImageSection>& sections,
-    std::uintptr_t target,
-    std::vector<std::uintptr_t>* slots)
-{
-    slots->clear();
-
-    for (const ImageSection& section : sections) {
-        if (!section_name_equals(section, ".rdata") && !section_name_equals(section, ".data")) {
-            continue;
-        }
-
-        if (section.size < sizeof(std::uintptr_t)) {
-            continue;
-        }
-
-        for (std::size_t offset = 0; offset <= section.size - sizeof(std::uintptr_t); offset += sizeof(std::uintptr_t)) {
-            std::uintptr_t value = 0;
-            if (!read_unaligned_pointer(section.begin + offset, &value)) {
-                continue;
-            }
-
-            if (value == target) {
-                slots->push_back(section.address + offset);
-            }
-        }
-    }
-}
-
-bool looks_like_msvc_function_start(const unsigned char* bytes, std::size_t available)
-{
-    if (bytes == nullptr || available < 16) {
-        return false;
-    }
-
-    if (available >= 31 &&
-        bytes[0] == 0x48 && bytes[1] == 0x89 && bytes[2] == 0x5c && bytes[3] == 0x24 &&
-        bytes[5] == 0x48 && bytes[6] == 0x89 && bytes[7] == 0x74 && bytes[8] == 0x24 &&
-        bytes[10] == 0x48 && bytes[11] == 0x89 && bytes[12] == 0x7c && bytes[13] == 0x24 &&
-        bytes[15] == 0x55) {
-        return true;
-    }
-
-    if (bytes[0] == 0x40 && bytes[1] == 0x53) {
-        return true;
-    }
-
-    return false;
-}
-
-bool find_enclosing_function_start(const ImageSection& text_section, std::uintptr_t reference, std::uintptr_t* function_start)
-{
-    if (!address_in_section(text_section, reference) || function_start == nullptr) {
-        return false;
-    }
-
-    const std::size_t reference_offset = reference - text_section.address;
-    const std::size_t min_offset = reference_offset > 0x600 ? reference_offset - 0x600 : 0;
-
-    for (std::size_t offset = reference_offset; offset >= min_offset; --offset) {
-        if (looks_like_msvc_function_start(text_section.begin + offset, text_section.size - offset)) {
-            *function_start = text_section.address + offset;
-            return true;
-        }
-
-        if (offset == 0) {
-            break;
-        }
-    }
-
-    return false;
+    return dtintutils_is_writable_address(&module, reinterpret_cast<const void*>(address)) != 0;
 }
 
 struct TargetReferenceCount
@@ -295,7 +55,7 @@ void add_target_reference(std::vector<TargetReferenceCount>* counts, std::uintpt
 }
 
 bool find_repeated_writable_rip_target(
-    const std::vector<ImageSection>& sections,
+    const DtIntUtilsModule& module,
     const ImageSection& text_section,
     std::uintptr_t range_start,
     std::uintptr_t range_end,
@@ -305,28 +65,34 @@ bool find_repeated_writable_rip_target(
         return false;
     }
 
-    const std::size_t start_offset = range_start - text_section.address;
-    const std::size_t end_offset = range_end - text_section.address;
+    const auto text_address = reinterpret_cast<std::uintptr_t>(text_section.start);
+    const std::size_t start_offset = range_start - text_address;
+    const std::size_t end_offset = range_end - text_address;
     std::vector<TargetReferenceCount> counts;
 
     if (end_offset < start_offset + 7) {
         return false;
     }
 
-    for (std::size_t offset = start_offset; offset <= end_offset - 7; ++offset) {
-        const auto instruction = text_section.begin + offset;
-        const auto instruction_address = text_section.address + offset;
-
-        std::uintptr_t resolved_target = 0;
-        if (!resolve_rip_relative_target(instruction, instruction_address, &resolved_target)) {
+    for (std::size_t offset = start_offset; offset < end_offset;) {
+        const auto instruction_address = text_section.start + offset;
+        DtIntUtilsInstruction instruction = {};
+        if (!dtintutils_decode(instruction_address, end_offset - offset, &instruction)) {
+            ++offset;
             continue;
         }
-
-        if (!address_in_any_writable_section(sections, resolved_target)) {
-            continue;
+        for (std::size_t operand_index = 0; operand_index < instruction.operand_count; ++operand_index) {
+            const DtIntUtilsOperand& operand = instruction.operands[operand_index];
+            if (operand.type == DTINTUTILS_OPERAND_MEMORY && operand.has_absolute &&
+                operand.memory_base == DTINTUTILS_REGISTER_RIP &&
+                address_in_any_writable_section(module, static_cast<std::uintptr_t>(operand.absolute))) {
+                add_target_reference(
+                    &counts,
+                    static_cast<std::uintptr_t>(operand.absolute),
+                    reinterpret_cast<std::uintptr_t>(instruction_address));
+            }
         }
-
-        add_target_reference(&counts, resolved_target, instruction_address);
+        offset += instruction.length;
     }
 
     std::uintptr_t best_target = 0;
@@ -356,30 +122,71 @@ bool find_repeated_writable_rip_target(
     return true;
 }
 
-bool matches_pattern(const unsigned char* bytes, const PatternByte* pattern, std::size_t pattern_size)
-{
-    for (std::size_t index = 0; index < pattern_size; ++index) {
-        if (!pattern[index].wildcard && bytes[index] != pattern[index].value) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 bool contains_bytes(const unsigned char* bytes, std::size_t size, const unsigned char* needle, std::size_t needle_size)
 {
-    if (bytes == nullptr || needle == nullptr || needle_size == 0 || size < needle_size) {
+    return dtintutils_contains_bytes(bytes, size, needle, needle_size) != 0;
+}
+
+using CandidateBodyValidator = bool (*)(const DtIntUtilsFunction& function);
+
+struct CandidateBodyValidatorContext
+{
+    CandidateBodyValidator validator = nullptr;
+};
+
+int validate_candidate_body(
+    const DtIntUtilsModule* module,
+    const unsigned char* candidate,
+    void* opaque_context)
+{
+    const auto* context = static_cast<const CandidateBodyValidatorContext*>(opaque_context);
+    DtIntUtilsFunction function = {};
+
+    if (module == nullptr || context == nullptr || context->validator == nullptr ||
+        !dtintutils_function_containing(module, candidate, &function) || function.start != candidate) {
         return false;
     }
 
-    for (std::size_t offset = 0; offset <= size - needle_size; ++offset) {
-        if (std::memcmp(bytes + offset, needle, needle_size) == 0) {
-            return true;
-        }
+    return context->validator(function) ? 1 : 0;
+}
+
+bool find_validated_pattern_symbol(
+    const DtIntUtilsModule& image,
+    const char* name,
+    const PatternByte* pattern,
+    std::size_t pattern_size,
+    CandidateBodyValidator validator,
+    std::uintptr_t* address)
+{
+    const DtIntUtilsLocatorStep steps[] = {
+        DTINTUTILS_LOCATE_PATTERN(".text", pattern, pattern_size, 1, 0),
+        DTINTUTILS_LOCATE_FILTER_FUNCTION_ENTRIES(1, 0),
+    };
+    const DtIntUtilsLocator locator = {
+        name,
+        steps,
+        sizeof(steps) / sizeof(steps[0]),
+    };
+    CandidateBodyValidatorContext context = {
+        validator,
+    };
+    const unsigned char* resolved = nullptr;
+    char utility_error[512] = {};
+
+    if (address == nullptr || !dtintutils_locate_unique_address_with_validator(
+            &image,
+            &locator,
+            &validate_candidate_body,
+            &context,
+            &resolved,
+            utility_error,
+            sizeof(utility_error))) {
+        set_last_error(address == nullptr ? "invalid pattern symbol output" : utility_error);
+        return false;
     }
 
-    return false;
+    *address = reinterpret_cast<std::uintptr_t>(resolved);
+    return true;
 }
 
 struct PlatformCallbackAssignment
@@ -392,31 +199,41 @@ struct PlatformCallbackAssignment
 bool read_platform_callback_assignment(
     const ImageSection& text_section,
     const unsigned char* instruction,
-    std::uintptr_t instruction_address,
     PlatformCallbackAssignment* assignment)
 {
+    DtIntUtilsInstruction load_function = {};
+    DtIntUtilsInstruction store_callback = {};
+
     if (instruction == nullptr || assignment == nullptr) {
         return false;
     }
-
-    if (!(instruction[0] == 0x48 && instruction[1] == 0x8d && instruction[2] == 0x05 &&
-          instruction[7] == 0x48 && instruction[8] == 0x89 && instruction[9] == 0x83)) {
+    if (!dtintutils_decode(instruction, 14, &load_function) ||
+        load_function.mnemonic != DTINTUTILS_MNEMONIC_LEA || load_function.operand_count != 2 ||
+        load_function.operands[0].type != DTINTUTILS_OPERAND_REGISTER ||
+        load_function.operands[0].size_bits != 64 ||
+        load_function.operands[1].type != DTINTUTILS_OPERAND_MEMORY ||
+        load_function.operands[1].memory_base != DTINTUTILS_REGISTER_RIP ||
+        !load_function.operands[1].has_absolute ||
+        !dtintutils_decode(
+            instruction + load_function.length,
+            14 - load_function.length,
+            &store_callback) ||
+        store_callback.mnemonic != DTINTUTILS_MNEMONIC_MOV || store_callback.operand_count != 2 ||
+        store_callback.operands[0].type != DTINTUTILS_OPERAND_MEMORY ||
+        store_callback.operands[0].memory_base != 3 ||
+        store_callback.operands[1].type != DTINTUTILS_OPERAND_REGISTER ||
+        store_callback.operands[1].register_id != load_function.operands[0].register_id) {
         return false;
     }
 
-    std::int32_t function_displacement = 0;
-    std::int32_t slot_offset = 0;
-    if (!read_unaligned_i32(instruction + 3, &function_displacement) ||
-        !read_unaligned_i32(instruction + 10, &slot_offset)) {
-        return false;
-    }
-
+    const auto slot_offset = store_callback.operands[0].displacement;
     if (slot_offset <= 0 || static_cast<std::uintptr_t>(slot_offset) >= kContextScanBytes ||
-        (slot_offset % static_cast<std::int32_t>(sizeof(std::uintptr_t))) != 0) {
+        (slot_offset % static_cast<std::int64_t>(sizeof(std::uintptr_t))) != 0) {
         return false;
     }
 
-    const auto function = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(instruction_address + 7) + function_displacement);
+    const auto instruction_address = reinterpret_cast<std::uintptr_t>(instruction);
+    const auto function = static_cast<std::uintptr_t>(load_function.operands[1].absolute);
     if (!address_in_section(text_section, function)) {
         return false;
     }
@@ -438,7 +255,8 @@ bool find_platform_clipboard_offsets(
         return false;
     }
 
-    const std::size_t reference_offset = version_reference - text_section.address;
+    const auto text_address = reinterpret_cast<std::uintptr_t>(text_section.start);
+    const std::size_t reference_offset = version_reference - text_address;
     const std::size_t scan_end = std::min<std::size_t>(text_section.size, reference_offset + 0x200);
     std::vector<PlatformCallbackAssignment> assignments;
 
@@ -451,8 +269,7 @@ bool find_platform_clipboard_offsets(
         PlatformCallbackAssignment assignment = {};
         if (read_platform_callback_assignment(
                 text_section,
-                text_section.begin + offset,
-                text_section.address + offset,
+                text_section.start + offset,
                 &assignment)) {
             assignments.push_back(assignment);
         }
@@ -484,8 +301,27 @@ bool find_platform_clipboard_offsets(
     }
 
     if (candidate_count != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "ImGui platform callback slot scan found %d candidates", candidate_count);
+        char message[512] = {};
+        int written = std::snprintf(
+            message,
+            sizeof(message),
+            "ImGui platform callback slot scan found %d candidates from %zu assignments",
+            candidate_count,
+            assignments.size());
+        for (std::size_t index = 0;
+             index < assignments.size() && index < 12 && written > 0 &&
+             static_cast<std::size_t>(written) < sizeof(message);
+             ++index) {
+            const int appended = std::snprintf(
+                message + written,
+                sizeof(message) - static_cast<std::size_t>(written),
+                " 0x%x",
+                assignments[index].slot_offset);
+            if (appended <= 0 || static_cast<std::size_t>(appended) >= sizeof(message) - static_cast<std::size_t>(written)) {
+                break;
+            }
+            written += appended;
+        }
         set_last_error(message);
         return false;
     }
@@ -495,7 +331,7 @@ bool find_platform_clipboard_offsets(
     return true;
 }
 
-bool find_add_font_symbol(const ImageSection& text_section, std::uintptr_t* add_font)
+bool find_add_font_symbol(const DtIntUtilsModule& image, std::uintptr_t* add_font)
 {
     static constexpr PatternByte kAddFontPattern[] = {
         {0x40, false}, {0x53, false}, {0x56, false}, {0x57, false}, {0x41, false}, {0x55, false}, {0x41, false}, {0x56, false},
@@ -510,51 +346,28 @@ bool find_add_font_symbol(const ImageSection& text_section, std::uintptr_t* add_
         {0x00, true}, {0x00, true},
     };
 
-    std::vector<std::uintptr_t> hits;
     const std::size_t pattern_size = sizeof(kAddFontPattern) / sizeof(kAddFontPattern[0]);
+    const DtIntUtilsLocatorStep steps[] = {
+        DTINTUTILS_LOCATE_PATTERN(".text", kAddFontPattern, pattern_size, 1, 1),
+    };
+    const DtIntUtilsLocator locator = {
+        "Dear ImGui AddFont",
+        steps,
+        sizeof(steps) / sizeof(steps[0]),
+    };
+    const unsigned char* address = nullptr;
+    char utility_error[512] = {};
 
-    if (text_section.size < pattern_size) {
-        set_last_error("Darktide .text section is too small for AddFont scan");
+    if (!dtintutils_locate_unique_address(&image, &locator, &address, utility_error, sizeof(utility_error))) {
+        set_last_error(utility_error);
         return false;
     }
 
-    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
-        if (matches_pattern(text_section.begin + offset, kAddFontPattern, pattern_size)) {
-            hits.push_back(text_section.address + offset);
-        }
-    }
-
-    if (hits.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "AddFont signature scan found %zu candidates", hits.size());
-        set_last_error(message);
-        return false;
-    }
-
-    *add_font = hits[0];
+    *add_font = reinterpret_cast<std::uintptr_t>(address);
     return true;
 }
 
-bool build_atlas_candidate_has_expected_body(const ImageSection& text_section, std::size_t offset)
-{
-    const std::size_t remaining = text_section.size - offset;
-    const std::size_t scan_size = std::min<std::size_t>(remaining, 0x500);
-    const unsigned char* bytes = text_section.begin + offset;
-
-    static constexpr unsigned char kStoreRendererHasTextures[] = {0x44, 0x88, 0x41, 0x51};
-    static constexpr unsigned char kTexIsBuiltAddress[] = {0x48, 0x8d, 0x59, 0x52};
-    static constexpr unsigned char kAtlasBuilderCheck[] = {0x48, 0x83, 0xb9, 0xb0, 0x02, 0x00, 0x00, 0x00};
-    static constexpr unsigned char kSetTexIsBuilt[] = {0xc6, 0x03, 0x01};
-    static constexpr unsigned char kStoreFrameCount[] = {0x89, 0xb5, 0xa4, 0x00, 0x00, 0x00};
-
-    return contains_bytes(bytes, scan_size, kStoreRendererHasTextures, sizeof(kStoreRendererHasTextures)) &&
-        contains_bytes(bytes, scan_size, kTexIsBuiltAddress, sizeof(kTexIsBuiltAddress)) &&
-        contains_bytes(bytes, scan_size, kAtlasBuilderCheck, sizeof(kAtlasBuilderCheck)) &&
-        contains_bytes(bytes, scan_size, kSetTexIsBuilt, sizeof(kSetTexIsBuilt)) &&
-        contains_bytes(bytes, scan_size, kStoreFrameCount, sizeof(kStoreFrameCount));
-}
-
-bool find_build_atlas_symbol(const ImageSection& text_section, std::uintptr_t* build_atlas)
+bool find_build_atlas_symbol(const DtIntUtilsModule& image, std::uintptr_t* build_atlas)
 {
     static constexpr PatternByte kBuildAtlasPattern[] = {
         {0x40, false}, {0x53, false}, {0x55, false}, {0x56, false}, {0x57, false}, {0x41, false}, {0x54, false},
@@ -564,41 +377,58 @@ bool find_build_atlas_symbol(const ImageSection& text_section, std::uintptr_t* b
         {0x00, true}, {0x48, false}, {0x83, false}, {0xb9, false}, {0xb0, false}, {0x02, false}, {0x00, false},
         {0x00, false}, {0x00, false}, {0xc6, false}, {0x03, false}, {0x01, false},
     };
+    static constexpr PatternByte kStoreRendererHasTextures[] = {
+        {0x44, false}, {0x88, false}, {0x41, false}, {0x51, false},
+    };
+    static constexpr PatternByte kTexIsBuiltAddress[] = {
+        {0x48, false}, {0x8d, false}, {0x59, false}, {0x52, false},
+    };
+    static constexpr PatternByte kAtlasBuilderCheck[] = {
+        {0x48, false}, {0x83, false}, {0xb9, false}, {0xb0, false},
+        {0x02, false}, {0x00, false}, {0x00, false}, {0x00, false},
+    };
+    static constexpr PatternByte kSetTexIsBuilt[] = {
+        {0xc6, false}, {0x03, false}, {0x01, false},
+    };
+    static constexpr PatternByte kStoreFrameCount[] = {
+        {0x89, false}, {0xb5, false}, {0xa4, false}, {0x00, false}, {0x00, false}, {0x00, false},
+    };
+    const DtIntUtilsLocatorStep steps[] = {
+        DTINTUTILS_LOCATE_PATTERN(
+            ".text", kBuildAtlasPattern, sizeof(kBuildAtlasPattern) / sizeof(kBuildAtlasPattern[0]), 1, 0),
+        DTINTUTILS_LOCATE_FILTER_PATTERN_NEAR(
+            kStoreRendererHasTextures, sizeof(kStoreRendererHasTextures) / sizeof(kStoreRendererHasTextures[0]),
+            0, 0x500, 1, 0),
+        DTINTUTILS_LOCATE_FILTER_PATTERN_NEAR(
+            kTexIsBuiltAddress, sizeof(kTexIsBuiltAddress) / sizeof(kTexIsBuiltAddress[0]), 0, 0x500, 1, 0),
+        DTINTUTILS_LOCATE_FILTER_PATTERN_NEAR(
+            kAtlasBuilderCheck, sizeof(kAtlasBuilderCheck) / sizeof(kAtlasBuilderCheck[0]), 0, 0x500, 1, 0),
+        DTINTUTILS_LOCATE_FILTER_PATTERN_NEAR(
+            kSetTexIsBuilt, sizeof(kSetTexIsBuilt) / sizeof(kSetTexIsBuilt[0]), 0, 0x500, 1, 0),
+        DTINTUTILS_LOCATE_FILTER_PATTERN_NEAR(
+            kStoreFrameCount, sizeof(kStoreFrameCount) / sizeof(kStoreFrameCount[0]), 0, 0x500, 1, 1),
+    };
+    const DtIntUtilsLocator locator = {
+        "Dear ImGui ImFontAtlas build/update",
+        steps,
+        sizeof(steps) / sizeof(steps[0]),
+    };
+    const unsigned char* address = nullptr;
+    char utility_error[512] = {};
 
-    std::vector<std::uintptr_t> hits;
-    const std::size_t pattern_size = sizeof(kBuildAtlasPattern) / sizeof(kBuildAtlasPattern[0]);
-
-    if (text_section.size < pattern_size) {
-        set_last_error("Darktide .text section is too small for ImFontAtlas build/update scan");
+    if (!dtintutils_locate_unique_address(&image, &locator, &address, utility_error, sizeof(utility_error))) {
+        set_last_error(utility_error);
         return false;
     }
 
-    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
-        if (!matches_pattern(text_section.begin + offset, kBuildAtlasPattern, pattern_size)) {
-            continue;
-        }
-
-        if (build_atlas_candidate_has_expected_body(text_section, offset)) {
-            hits.push_back(text_section.address + offset);
-        }
-    }
-
-    if (hits.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "ImFontAtlas build/update signature scan found %zu candidates", hits.size());
-        set_last_error(message);
-        return false;
-    }
-
-    *build_atlas = hits[0];
+    *build_atlas = reinterpret_cast<std::uintptr_t>(address);
     return true;
 }
 
-bool render_text_candidate_has_expected_body(const ImageSection& text_section, std::size_t offset)
+bool render_text_candidate_has_expected_body(const DtIntUtilsFunction& function)
 {
-    const std::size_t remaining = text_section.size - offset;
-    const std::size_t scan_size = std::min<std::size_t>(remaining, 0x900);
-    const unsigned char* bytes = text_section.begin + offset;
+    const std::size_t scan_size = std::min<std::size_t>(function.size, 0x900);
+    const unsigned char* bytes = function.start;
 
     static constexpr unsigned char kLargeTextLimit[] = {0x48, 0x3d, 0x10, 0x27, 0x00, 0x00};
     static constexpr unsigned char kUtf8AsciiLimit8[] = {0x83, 0xf9, 0x80};
@@ -613,7 +443,9 @@ bool render_text_candidate_has_expected_body(const ImageSection& text_section, s
         contains_bytes(bytes, scan_size, kCarriageReturnCheck, sizeof(kCarriageReturnCheck));
 }
 
-bool find_render_text_symbol(const ImageSection& text_section, std::uintptr_t* render_text)
+bool find_render_text_symbol(
+    const DtIntUtilsModule& image,
+    std::uintptr_t* render_text)
 {
     static constexpr PatternByte kRenderTextPattern[] = {
         {0x4c, false}, {0x8b, false}, {0xdc, false}, {0x4d, false}, {0x89, false}, {0x4b, false}, {0x20, false},
@@ -623,40 +455,20 @@ bool find_render_text_symbol(const ImageSection& text_section, std::uintptr_t* r
         {0xec, false}, {0x00, true}, {0x00, true}, {0x00, true}, {0x00, true},
     };
 
-    std::vector<std::uintptr_t> hits;
     const std::size_t pattern_size = sizeof(kRenderTextPattern) / sizeof(kRenderTextPattern[0]);
-
-    if (text_section.size < pattern_size) {
-        set_last_error("Darktide .text section is too small for RenderText scan");
-        return false;
-    }
-
-    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
-        if (!matches_pattern(text_section.begin + offset, kRenderTextPattern, pattern_size)) {
-            continue;
-        }
-
-        if (render_text_candidate_has_expected_body(text_section, offset)) {
-            hits.push_back(text_section.address + offset);
-        }
-    }
-
-    if (hits.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "RenderText signature scan found %zu candidates", hits.size());
-        set_last_error(message);
-        return false;
-    }
-
-    *render_text = hits[0];
-    return true;
+    return find_validated_pattern_symbol(
+        image,
+        "Dear ImGui RenderText",
+        kRenderTextPattern,
+        pattern_size,
+        &render_text_candidate_has_expected_body,
+        render_text);
 }
 
-bool calc_text_size_candidate_has_expected_body(const ImageSection& text_section, std::size_t offset)
+bool calc_text_size_candidate_has_expected_body(const DtIntUtilsFunction& function)
 {
-    const std::size_t remaining = text_section.size - offset;
-    const std::size_t scan_size = std::min<std::size_t>(remaining, 0x500);
-    const unsigned char* bytes = text_section.begin + offset;
+    const std::size_t scan_size = std::min<std::size_t>(function.size, 0x500);
+    const unsigned char* bytes = function.start;
 
     static constexpr unsigned char kNullTextEndStrlenLoop[] = {
         0x48, 0x85, 0xff, 0x75, 0x18, 0x48, 0xc7, 0xc7,
@@ -674,7 +486,9 @@ bool calc_text_size_candidate_has_expected_body(const ImageSection& text_section
         contains_bytes(bytes, scan_size, kCarriageReturnCheck, sizeof(kCarriageReturnCheck));
 }
 
-bool find_calc_text_size_symbol(const ImageSection& text_section, std::uintptr_t* calc_text_size)
+bool find_calc_text_size_symbol(
+    const DtIntUtilsModule& image,
+    std::uintptr_t* calc_text_size)
 {
     static constexpr PatternByte kCalcTextSizePattern[] = {
         {0x48, false}, {0x8b, false}, {0xc4, false}, {0x48, false}, {0x89, false}, {0x48, false}, {0x08, false},
@@ -684,40 +498,20 @@ bool find_calc_text_size_symbol(const ImageSection& text_section, std::uintptr_t
         {0x89, false}, {0x68, false}, {0x10, false}, {0x48, false}, {0x8b, false}, {0xe9, false},
     };
 
-    std::vector<std::uintptr_t> hits;
     const std::size_t pattern_size = sizeof(kCalcTextSizePattern) / sizeof(kCalcTextSizePattern[0]);
-
-    if (text_section.size < pattern_size) {
-        set_last_error("Darktide .text section is too small for CalcTextSize scan");
-        return false;
-    }
-
-    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
-        if (!matches_pattern(text_section.begin + offset, kCalcTextSizePattern, pattern_size)) {
-            continue;
-        }
-
-        if (calc_text_size_candidate_has_expected_body(text_section, offset)) {
-            hits.push_back(text_section.address + offset);
-        }
-    }
-
-    if (hits.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "CalcTextSize signature scan found %zu candidates", hits.size());
-        set_last_error(message);
-        return false;
-    }
-
-    *calc_text_size = hits[0];
-    return true;
+    return find_validated_pattern_symbol(
+        image,
+        "Dear ImGui CalcTextSize",
+        kCalcTextSizePattern,
+        pattern_size,
+        &calc_text_size_candidate_has_expected_body,
+        calc_text_size);
 }
 
-bool add_input_character_candidate_has_expected_body(const ImageSection& text_section, std::size_t offset)
+bool add_input_character_candidate_has_expected_body(const DtIntUtilsFunction& function)
 {
-    const std::size_t remaining = text_section.size - offset;
-    const std::size_t scan_size = std::min<std::size_t>(remaining, 0x100);
-    const unsigned char* bytes = text_section.begin + offset;
+    const std::size_t scan_size = std::min<std::size_t>(function.size, 0x100);
+    const unsigned char* bytes = function.start;
 
     static constexpr unsigned char kAppAcceptingEventsCheck[] = {
         0x80, 0xb9, 0xe5, 0x0b, 0x00, 0x00, 0x00,
@@ -738,7 +532,9 @@ bool add_input_character_candidate_has_expected_body(const ImageSection& text_se
         contains_bytes(bytes, scan_size, kKeyboardEventSource, sizeof(kKeyboardEventSource));
 }
 
-bool find_add_input_character_symbol(const ImageSection& text_section, std::uintptr_t* add_input_character)
+bool find_add_input_character_symbol(
+    const DtIntUtilsModule& image,
+    std::uintptr_t* add_input_character)
 {
     static constexpr PatternByte kAddInputCharacterPattern[] = {
         {0x85, false}, {0xd2, false}, {0x0f, false}, {0x84, false},
@@ -746,40 +542,20 @@ bool find_add_input_character_symbol(const ImageSection& text_section, std::uint
         {0x53, false}, {0x48, false}, {0x83, false}, {0xec, false}, {0x40, false},
     };
 
-    std::vector<std::uintptr_t> hits;
     const std::size_t pattern_size = sizeof(kAddInputCharacterPattern) / sizeof(kAddInputCharacterPattern[0]);
-
-    if (text_section.size < pattern_size) {
-        set_last_error("Darktide .text section is too small for AddInputCharacter scan");
-        return false;
-    }
-
-    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
-        if (!matches_pattern(text_section.begin + offset, kAddInputCharacterPattern, pattern_size)) {
-            continue;
-        }
-
-        if (add_input_character_candidate_has_expected_body(text_section, offset)) {
-            hits.push_back(text_section.address + offset);
-        }
-    }
-
-    if (hits.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "AddInputCharacter signature scan found %zu candidates", hits.size());
-        set_last_error(message);
-        return false;
-    }
-
-    *add_input_character = hits[0];
-    return true;
+    return find_validated_pattern_symbol(
+        image,
+        "Dear ImGui AddInputCharacter",
+        kAddInputCharacterPattern,
+        pattern_size,
+        &add_input_character_candidate_has_expected_body,
+        add_input_character);
 }
 
-bool win32_message_handler_candidate_has_expected_body(const ImageSection& text_section, std::size_t offset)
+bool win32_message_handler_candidate_has_expected_body(const DtIntUtilsFunction& function)
 {
-    const std::size_t remaining = text_section.size - offset;
-    const std::size_t scan_size = std::min<std::size_t>(remaining, 0xa20);
-    const unsigned char* bytes = text_section.begin + offset;
+    const std::size_t scan_size = std::min<std::size_t>(function.size, 0xa20);
+    const unsigned char* bytes = function.start;
 
     static constexpr unsigned char kBackendDataLoad[] = {
         0x48, 0x8b, 0xb3, 0xa0, 0x00, 0x00, 0x00,
@@ -804,7 +580,9 @@ bool win32_message_handler_candidate_has_expected_body(const ImageSection& text_
         contains_bytes(bytes, scan_size, kInputEventsQueueLoadBody, sizeof(kInputEventsQueueLoadBody));
 }
 
-bool find_win32_message_handler_symbol(const ImageSection& text_section, std::uintptr_t* win32_message_handler)
+bool find_win32_message_handler_symbol(
+    const DtIntUtilsModule& image,
+    std::uintptr_t* win32_message_handler)
 {
     static constexpr PatternByte kWin32MessageHandlerPattern[] = {
         {0x48, false}, {0x8b, false}, {0xc4, false}, {0x48, false}, {0x89, false},
@@ -817,33 +595,14 @@ bool find_win32_message_handler_symbol(const ImageSection& text_section, std::ui
         {0xa0, false}, {0x00, false}, {0x00, false}, {0x00, false},
     };
 
-    std::vector<std::uintptr_t> hits;
     const std::size_t pattern_size = sizeof(kWin32MessageHandlerPattern) / sizeof(kWin32MessageHandlerPattern[0]);
-
-    if (text_section.size < pattern_size) {
-        set_last_error("Darktide .text section is too small for Win32 message handler scan");
-        return false;
-    }
-
-    for (std::size_t offset = 0; offset <= text_section.size - pattern_size; ++offset) {
-        if (!matches_pattern(text_section.begin + offset, kWin32MessageHandlerPattern, pattern_size)) {
-            continue;
-        }
-
-        if (win32_message_handler_candidate_has_expected_body(text_section, offset)) {
-            hits.push_back(text_section.address + offset);
-        }
-    }
-
-    if (hits.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "Win32 message handler signature scan found %zu candidates", hits.size());
-        set_last_error(message);
-        return false;
-    }
-
-    *win32_message_handler = hits[0];
-    return true;
+    return find_validated_pattern_symbol(
+        image,
+        "Dear ImGui Win32 message handler",
+        kWin32MessageHandlerPattern,
+        pattern_size,
+        &win32_message_handler_candidate_has_expected_body,
+        win32_message_handler);
 }
 
 bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
@@ -853,73 +612,96 @@ bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
         return false;
     }
 
-    HMODULE module = GetModuleHandleW(nullptr);
-    if (module == nullptr) {
-        set_last_error("GetModuleHandleW(NULL) failed");
+    DtIntUtilsModule image = {};
+    char utility_error[512] = {};
+    if (!dtintutils_module_init_current(&image, utility_error, sizeof(utility_error))) {
+        set_last_error(utility_error);
         return false;
     }
 
-    const auto module_base = reinterpret_cast<std::uintptr_t>(module);
-
-    std::vector<ImageSection> sections;
-    if (!get_image_sections(module_base, &sections)) {
+    const auto module_base = reinterpret_cast<std::uintptr_t>(image.base);
+    const ImageSection text_section = *image.text;
+    const DtIntUtilsLocatorStep create_context_reference_steps[] = {
+        DTINTUTILS_LOCATE_STRING_PREFIX(".rdata", kDearImguiPrefix, 1, 1),
+        DTINTUTILS_LOCATE_POINTER_SLOTS(1, 1),
+        DTINTUTILS_LOCATE_RIP_REFERENCES(DTINTUTILS_MNEMONIC_ANY, ".text", 1, 1),
+    };
+    DtIntUtilsLocator create_context_reference_locator = {
+        "Dear ImGui CreateContext reference",
+        create_context_reference_steps,
+        sizeof(create_context_reference_steps) / sizeof(create_context_reference_steps[0]),
+    };
+    const unsigned char* create_context_reference = nullptr;
+    if (!dtintutils_locate_unique_address(
+            &image,
+            &create_context_reference_locator,
+            &create_context_reference,
+            utility_error,
+            sizeof(utility_error))) {
+        set_last_error(utility_error);
         return false;
     }
 
-    ImageSection text_section = {};
-    ImageSection rdata_section = {};
-    if (!find_section(sections, ".text", &text_section)) {
-        set_last_error("Darktide .text section not found");
+    DtIntUtilsInstruction reference_instruction = {};
+    const auto text_end_address = reinterpret_cast<std::uintptr_t>(text_section.start) + text_section.size;
+    const auto reference_address = reinterpret_cast<std::uintptr_t>(create_context_reference);
+    if (!dtintutils_decode(
+            create_context_reference,
+            text_end_address - reference_address,
+            &reference_instruction)) {
+        set_last_error("failed to decode Dear ImGui CreateContext version reference");
         return false;
     }
 
-    if (!find_section(sections, ".rdata", &rdata_section)) {
-        set_last_error("Darktide .rdata section not found");
+    std::uintptr_t version_pointer_slot = 0;
+    std::size_t slot_operand_count = 0;
+    for (std::size_t index = 0; index < reference_instruction.operand_count; ++index) {
+        const DtIntUtilsOperand& operand = reference_instruction.operands[index];
+        if (operand.type == DTINTUTILS_OPERAND_MEMORY &&
+            operand.memory_base == DTINTUTILS_REGISTER_RIP && operand.has_absolute) {
+            version_pointer_slot = static_cast<std::uintptr_t>(operand.absolute);
+            ++slot_operand_count;
+        }
+    }
+    const ImageSection* version_slot_section = dtintutils_section_for_address(
+        &image, reinterpret_cast<const void*>(version_pointer_slot));
+    if (slot_operand_count != 1 || version_slot_section == nullptr ||
+        (std::strcmp(version_slot_section->name, ".rdata") != 0 &&
+         std::strcmp(version_slot_section->name, ".data") != 0) ||
+        (version_slot_section->characteristics & IMAGE_SCN_MEM_READ) == 0 ||
+        (version_slot_section->characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) {
+        set_last_error("Dear ImGui CreateContext reference did not resolve one readable version pointer slot");
         return false;
     }
 
-    std::vector<std::uintptr_t> version_strings;
-    find_ascii_prefix_in_section(rdata_section, kDearImguiPrefix, &version_strings);
-    if (version_strings.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "Dear ImGui version string scan found %zu candidates", version_strings.size());
-        set_last_error(message);
+    std::uintptr_t version_string = 0;
+    char version_text[64] = {};
+    const ImageSection* rdata_section = dtintutils_section(&image, ".rdata");
+    if (!read_value(version_pointer_slot, &version_string) || rdata_section == nullptr ||
+        !address_in_section(*rdata_section, version_string) ||
+        !read_c_string(version_string, version_text, sizeof(version_text)) ||
+        std::strncmp(version_text, kDearImguiPrefix, sizeof(kDearImguiPrefix) - 1) != 0) {
+        set_last_error("Dear ImGui version pointer slot did not resolve the expected version string");
         return false;
     }
 
-    std::vector<std::uintptr_t> version_pointer_slots;
-    find_pointer_slots_to(sections, version_strings[0], &version_pointer_slots);
-    if (version_pointer_slots.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "Dear ImGui version pointer slot scan found %zu candidates", version_pointer_slots.size());
-        set_last_error(message);
-        return false;
-    }
-
-    std::vector<std::uintptr_t> version_pointer_references;
-    find_rip_relative_references(text_section, version_pointer_slots[0], &version_pointer_references);
-    if (version_pointer_references.size() != 1) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "Dear ImGui version pointer xref scan found %zu candidates", version_pointer_references.size());
-        set_last_error(message);
-        return false;
-    }
-
-    std::uintptr_t create_context = 0;
-    if (!find_enclosing_function_start(text_section, version_pointer_references[0], &create_context)) {
+    DtIntUtilsFunction create_context_function = {};
+    if (!dtintutils_function_containing(&image, create_context_reference, &create_context_function)) {
         set_last_error("failed to find Dear ImGui CreateContext function start");
         return false;
     }
+    const std::uintptr_t create_context = reinterpret_cast<std::uintptr_t>(create_context_function.start);
+    const std::uintptr_t version_pointer_reference = reinterpret_cast<std::uintptr_t>(create_context_reference);
 
     const std::uintptr_t g_scan_start = create_context;
-    std::uintptr_t g_scan_end = version_pointer_references[0] + 0x100;
-    const std::uintptr_t text_end = text_section.address + text_section.size;
+    std::uintptr_t g_scan_end = version_pointer_reference + 0x100;
+    const std::uintptr_t text_end = reinterpret_cast<std::uintptr_t>(text_section.start) + text_section.size;
     if (g_scan_end > text_end) {
         g_scan_end = text_end;
     }
 
     std::uintptr_t g_imgui_storage = 0;
-    if (!find_repeated_writable_rip_target(sections, text_section, g_scan_start, g_scan_end, &g_imgui_storage)) {
+    if (!find_repeated_writable_rip_target(image, text_section, g_scan_start, g_scan_end, &g_imgui_storage)) {
         return false;
     }
 
@@ -927,45 +709,45 @@ bool resolve_imgui_symbols_uncached(ResolvedImguiSymbols* symbols)
     std::uintptr_t platform_set_clipboard_text_offset = 0;
     if (!find_platform_clipboard_offsets(
             text_section,
-            version_pointer_references[0],
+            version_pointer_reference,
             &platform_get_clipboard_text_offset,
             &platform_set_clipboard_text_offset)) {
         return false;
     }
 
     std::uintptr_t add_font = 0;
-    if (!find_add_font_symbol(text_section, &add_font)) {
+    if (!find_add_font_symbol(image, &add_font)) {
         return false;
     }
 
     std::uintptr_t build_atlas = 0;
-    if (!find_build_atlas_symbol(text_section, &build_atlas)) {
+    if (!find_build_atlas_symbol(image, &build_atlas)) {
         return false;
     }
 
     std::uintptr_t calc_text_size = 0;
-    if (!find_calc_text_size_symbol(text_section, &calc_text_size)) {
+    if (!find_calc_text_size_symbol(image, &calc_text_size)) {
         return false;
     }
 
     std::uintptr_t render_text = 0;
-    if (!find_render_text_symbol(text_section, &render_text)) {
+    if (!find_render_text_symbol(image, &render_text)) {
         return false;
     }
 
     std::uintptr_t add_input_character = 0;
-    if (!find_add_input_character_symbol(text_section, &add_input_character)) {
+    if (!find_add_input_character_symbol(image, &add_input_character)) {
         return false;
     }
 
     std::uintptr_t win32_message_handler = 0;
-    if (!find_win32_message_handler_symbol(text_section, &win32_message_handler)) {
+    if (!find_win32_message_handler_symbol(image, &win32_message_handler)) {
         return false;
     }
 
     symbols->module_base = module_base;
-    symbols->version_string = version_strings[0];
-    symbols->version_pointer_slot = version_pointer_slots[0];
+    symbols->version_string = version_string;
+    symbols->version_pointer_slot = version_pointer_slot;
     symbols->create_context = create_context;
     symbols->g_imgui_storage = g_imgui_storage;
     symbols->add_font = add_font;

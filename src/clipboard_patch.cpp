@@ -2,7 +2,6 @@
 
 #include "imgui_atlas.h"
 #include "imgui_symbols.h"
-#include "writable_memory.h"
 
 #include <string>
 

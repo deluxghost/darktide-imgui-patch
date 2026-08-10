@@ -1,10 +1,8 @@
 #include "input_patch.h"
 
+#include "dtintutils.h"
 #include "imgui_symbols.h"
 
-#include <array>
-#include <cstdio>
-#include <cstring>
 #include <mutex>
 
 #pragma comment(lib, "imm32.lib")
@@ -13,118 +11,14 @@ namespace imgui_patch
 {
 namespace
 {
-constexpr std::size_t kAbsoluteJumpSize = 14;
-constexpr std::size_t kMaxDetourPatchSize = 32;
-constexpr std::size_t kMsgHandlerPatchSize = 19;
-
 using AddInputCharFn = void(__fastcall*)(void* io, unsigned int character);
 using Win32MsgHandlerFn = LRESULT(__fastcall*)(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void* io);
 
-struct DetourState
-{
-    std::uintptr_t target = 0;
-    void* trampoline = nullptr;
-    std::array<unsigned char, kMaxDetourPatchSize> original_bytes = {};
-    std::size_t patch_size = 0;
-};
-
 std::mutex g_input_mutex;
-DetourState g_msg_handler_detour;
-Win32MsgHandlerFn g_original_msg_handler = nullptr;
+DtIntUtilsHook g_msg_handler_hook;
 AddInputCharFn g_add_input_char = nullptr;
 bool g_input_patch_installed = false;
-thread_local WPARAM g_pending_surrogate = 0;
-
-bool win32_message_handler_has_expected_prologue(const unsigned char* target)
-{
-    static constexpr unsigned char kExpectedPrefix[] = {
-        0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70,
-        0x10, 0x48, 0x89, 0x78, 0x20, 0x4c, 0x89, 0x40, 0x18,
-    };
-
-    return std::memcmp(target, kExpectedPrefix, sizeof(kExpectedPrefix)) == 0;
-}
-
-void write_absolute_jump(unsigned char* target, const void* destination)
-{
-    target[0] = 0xff;
-    target[1] = 0x25;
-    target[2] = 0x00;
-    target[3] = 0x00;
-    target[4] = 0x00;
-    target[5] = 0x00;
-
-    const auto destination_address = reinterpret_cast<std::uintptr_t>(destination);
-    std::memcpy(target + 6, &destination_address, sizeof(destination_address));
-}
-
-bool create_trampoline(DetourState* detour)
-{
-    if (detour->trampoline != nullptr) {
-        return true;
-    }
-
-    const std::size_t trampoline_size = detour->patch_size + kAbsoluteJumpSize;
-    void* trampoline = VirtualAlloc(nullptr, trampoline_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (trampoline == nullptr) {
-        set_last_error(win32_message("VirtualAlloc(input trampoline)", GetLastError()));
-        return false;
-    }
-
-    auto* trampoline_bytes = reinterpret_cast<unsigned char*>(trampoline);
-    std::memcpy(trampoline_bytes, reinterpret_cast<const void*>(detour->target), detour->patch_size);
-    write_absolute_jump(trampoline_bytes + detour->patch_size, reinterpret_cast<const void*>(detour->target + detour->patch_size));
-    FlushInstructionCache(GetCurrentProcess(), trampoline, trampoline_size);
-
-    detour->trampoline = trampoline;
-    return true;
-}
-
-bool install_detour(
-    DetourState* detour,
-    std::uintptr_t target_address,
-    std::size_t patch_size,
-    const void* hook,
-    bool (*validate_prologue)(const unsigned char*),
-    const char* name)
-{
-    if (patch_size < kAbsoluteJumpSize || patch_size > kMaxDetourPatchSize) {
-        set_last_error("invalid input detour patch size");
-        return false;
-    }
-
-    auto* target = reinterpret_cast<unsigned char*>(target_address);
-    if (!validate_prologue(target)) {
-        char message[256] = {};
-        std::snprintf(message, sizeof(message), "resolved %s prologue did not match", name);
-        set_last_error(message);
-        return false;
-    }
-
-    detour->target = target_address;
-    detour->patch_size = patch_size;
-    std::memcpy(detour->original_bytes.data(), target, patch_size);
-
-    if (!create_trampoline(detour)) {
-        return false;
-    }
-
-    DWORD old_protect = 0;
-    if (!VirtualProtect(target, patch_size, PAGE_EXECUTE_READWRITE, &old_protect)) {
-        set_last_error(win32_message("VirtualProtect(input detour)", GetLastError()));
-        return false;
-    }
-
-    unsigned char patch[kMaxDetourPatchSize] = {};
-    write_absolute_jump(patch, hook);
-    std::memset(patch + kAbsoluteJumpSize, 0x90, patch_size - kAbsoluteJumpSize);
-    std::memcpy(target, patch, patch_size);
-
-    DWORD ignored = 0;
-    VirtualProtect(target, patch_size, old_protect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), target, patch_size);
-    return true;
-}
+thread_local unsigned int g_pending_surrogate = 0;
 
 bool is_ime_open(HWND hwnd)
 {
@@ -138,39 +32,53 @@ bool is_ime_open(HWND hwnd)
     return open;
 }
 
+void submit_utf16_code_unit(void* io, WPARAM wparam)
+{
+    if (wparam > 0xffff) {
+        g_pending_surrogate = 0;
+        return;
+    }
+
+    const unsigned int code_unit = static_cast<unsigned int>(wparam);
+    if (code_unit >= 0xd800 && code_unit <= 0xdbff) {
+        g_pending_surrogate = code_unit;
+        return;
+    }
+    if (code_unit >= 0xdc00 && code_unit <= 0xdfff) {
+        if (g_pending_surrogate != 0 && g_add_input_char != nullptr) {
+            const unsigned int codepoint =
+                0x10000 + ((g_pending_surrogate - 0xd800) << 10) + (code_unit - 0xdc00);
+            g_add_input_char(io, codepoint);
+        }
+        g_pending_surrogate = 0;
+        return;
+    }
+
+    g_pending_surrogate = 0;
+    if (code_unit != 0 && g_add_input_char != nullptr) {
+        g_add_input_char(io, code_unit);
+    }
+}
+
 LRESULT __fastcall win32_message_handler_hook(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void* io)
 {
     if (message == WM_IME_CHAR || message == WM_CHAR) {
         if (is_ime_open(hwnd)) {
             if (message == WM_IME_CHAR) {
-                if (wparam >= 0xD800 && wparam <= 0xDBFF) {
-                    g_pending_surrogate = wparam;
-                } else if (wparam >= 0xDC00 && wparam <= 0xDFFF && g_pending_surrogate != 0) {
-                    const unsigned int codepoint =
-                        0x10000 + ((g_pending_surrogate - 0xD800) << 10) + (wparam - 0xDC00);
-                    g_pending_surrogate = 0;
-                    if (g_add_input_char != nullptr) {
-                        g_add_input_char(io, codepoint);
-                    }
-                } else {
-                    g_pending_surrogate = 0;
-                    if (wparam > 0 && wparam < 0xD800 && g_add_input_char != nullptr) {
-                        g_add_input_char(io, static_cast<unsigned int>(wparam));
-                    }
-                }
+                submit_utf16_code_unit(io, wparam);
             }
 
             return 1;
         }
 
-        if (message == WM_CHAR && wparam > 0 && wparam < 0xD800 && g_add_input_char != nullptr) {
-            g_add_input_char(io, static_cast<unsigned int>(wparam));
+        if (message == WM_CHAR) {
+            submit_utf16_code_unit(io, wparam);
         }
 
         return 0;
     }
 
-    const Win32MsgHandlerFn original = g_original_msg_handler;
+    const auto original = reinterpret_cast<Win32MsgHandlerFn>(g_msg_handler_hook.trampoline);
     if (original == nullptr) {
         return 0;
     }
@@ -204,18 +112,24 @@ bool install_input_patch()
 
     g_add_input_char = reinterpret_cast<AddInputCharFn>(symbols.add_input_character);
 
-    if (!install_detour(
-            &g_msg_handler_detour,
-            symbols.win32_message_handler,
-            kMsgHandlerPatchSize,
-            reinterpret_cast<const void*>(&win32_message_handler_hook),
-            win32_message_handler_has_expected_prologue,
-            "Win32 message handler")) {
+    static constexpr unsigned char kExpectedPrefix[] = {
+        0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70,
+        0x10, 0x48, 0x89, 0x78, 0x20, 0x4c, 0x89, 0x40, 0x18,
+    };
+    char utility_error[512] = {};
+    if (!dtintutils_hook_install_exact(
+            &g_msg_handler_hook,
+            reinterpret_cast<void*>(symbols.win32_message_handler),
+            reinterpret_cast<void*>(&win32_message_handler_hook),
+            kExpectedPrefix,
+            sizeof(kExpectedPrefix),
+            utility_error,
+            sizeof(utility_error))) {
+        set_last_error(utility_error);
         g_add_input_char = nullptr;
         return false;
     }
 
-    g_original_msg_handler = reinterpret_cast<Win32MsgHandlerFn>(g_msg_handler_detour.trampoline);
     g_input_patch_installed = true;
     return true;
 }

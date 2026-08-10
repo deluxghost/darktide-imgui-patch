@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -107,7 +108,7 @@ struct InstalledFont
     std::wstring path;
     std::wstring family_name;
     std::uint32_t face_index = 0;
-    std::vector<unsigned char> bytes;
+    std::shared_ptr<const std::vector<unsigned char>> bytes;
     std::vector<std::uint16_t> glyph_ranges;
 };
 
@@ -159,6 +160,7 @@ void set_last_error(const char* message);
 void set_last_error(const std::string& message);
 
 bool is_readable(const void* address, std::size_t size);
+bool is_writable(std::uintptr_t address, std::size_t size);
 
 template <typename T>
 bool read_value(std::uintptr_t address, T* value)
@@ -171,8 +173,18 @@ bool read_value(std::uintptr_t address, T* value)
     return true;
 }
 
+template <typename T>
+bool write_value(std::uintptr_t address, const T& value)
+{
+    if (!is_writable(address, sizeof(T))) {
+        return false;
+    }
+
+    std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(T));
+    return true;
+}
+
 bool read_c_string(std::uintptr_t address, char* buffer, std::size_t buffer_size);
-bool append(char** cursor, int* remaining, const char* format, ...);
 std::string hresult_message(const char* operation, HRESULT result);
 std::string win32_message(const char* operation, DWORD error);
 bool contains_non_ascii(const char* value);
